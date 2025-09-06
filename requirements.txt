@@ -1,0 +1,10 @@
+librosa>=0.10.0
+numpy>=1.21.0
+scipy>=1.7.0
+mido>=1.2.10
+requests>=2.25.0
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
+pygame>=2.0.0
+dtaidistance>=2.3.0
+google-generativeai>=0.8.0
