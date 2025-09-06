@@ -321,19 +321,18 @@ class MusicAnalyzer:
             return None, None, None
 
     def compare_performances(self, audio_path, use_digitizer=True):
-        """Enhanced performance comparison with multiple analysis methods"""
+        """Enhanced performance comparison with multiple analysis methods (backward-compatible)."""
         print(f"\n🎯 Comparing performance against '{self.piece_info['title']}'...")
-        
+
         if use_digitizer and ENHANCED_FEATURES_AVAILABLE:
             # Use new digitizer approach
             return self.analyze_performance_with_digitizer(audio_path)
-        
+
         # Fallback to original method if digitizer not available
         onset_times, f0, times = self.analyze_performance_audio(audio_path)
-        
         if onset_times is None:
             return None
-            
+
         reference_melody = self.piece_info['melody']
         report = {
             "metadata": {
@@ -345,94 +344,152 @@ class MusicAnalyzer:
             },
             "note_details": []
         }
-        
-        # Calculate expected timings for reference notes
+
+        # tempo-aware expected timings
         seconds_per_beat = 60.0 / self.tempo
         expected_times = []
         current_time = 0.0
-        
         for note in reference_melody:
             expected_times.append(current_time)
             current_time += note['duration'] * 4 * seconds_per_beat
-        
-        # Track which onsets have been used
+        expected_times = np.asarray(expected_times, dtype=float)
+
+        #clean & sort onsets; remove near-duplicates (<30 ms)
+        onset_times = np.asarray(onset_times, dtype=float)
+        if onset_times.size:
+            onset_times = np.sort(onset_times)
+            if onset_times.size > 1:
+                diffs = np.diff(onset_times)
+                keep = np.r_[True, diffs >= 0.03]  # 30 ms min separation
+                onset_times = onset_times[keep]
+
+        # tempo-aware window + global offset estimate for fairer matching 
+        # Scale window by tempo (min 80 ms). Default ~0.6 beats works well for slight drift/latency.
+        time_window = max(0.08, 0.6 * seconds_per_beat)
+
+        # Robust global offset: compare first few expected onsets to nearest performance onsets
+        # (used only to aid matching; *reporting* still uses the original expected times)
+        if onset_times.size and expected_times.size:
+            k = int(min(6, onset_times.size, expected_times.size))
+            idx = np.clip(np.searchsorted(onset_times, expected_times[:k]), 0, max(0, onset_times.size - 1))
+            # for border cases, also consider previous candidate and pick closer
+            idx_prev = np.clip(idx - 1, 0, max(0, onset_times.size - 1))
+            best_idxs = np.where(
+                np.abs(onset_times[idx] - expected_times[:k]) <= np.abs(onset_times[idx_prev] - expected_times[:k]),
+                idx, idx_prev
+            )
+            offs = onset_times[best_idxs] - expected_times[:k]
+            global_offset = float(np.median(offs)) if offs.size else 0.0
+            # clamp ridiculous offsets to ~1.5 beats
+            global_offset = float(np.clip(global_offset, -1.5 * seconds_per_beat, 1.5 * seconds_per_beat))
+        else:
+            global_offset = 0.0
+
         used_onsets = set()
         missed_notes = 0
-        
-        # Match each reference note to detected onsets
+
+        # Helper to get pitch stats around a given onset time (uses 'times' when available)
+        def _pitch_at_time(t_sec):
+            # prefer index via 'times' to avoid assuming hop_length
+            if times is not None and len(times):
+                onset_idx = int(np.searchsorted(times, t_sec))
+            else:
+                # fallback to original 512-hop assumption
+                onset_idx = int(t_sec * getattr(self, "sample_rate", 22050) / 512)
+
+            if onset_idx < 0 or f0 is None or onset_idx >= len(f0):
+                return None, None  # (detected_name, midi)
+
+            s = max(0, onset_idx - 5)
+            e = min(len(f0), onset_idx + 15)
+            seg = f0[s:e]
+            if seg is None or len(seg) == 0:
+                return None, None
+            seg = seg[~np.isnan(seg)]
+            if len(seg) == 0:
+                return None, None
+
+            detected_hz = float(np.nanmedian(seg))
+            detected_midi = float(librosa.hz_to_midi(detected_hz))
+            detected_name = librosa.midi_to_note(detected_midi)
+            return detected_name, detected_midi
+
+        # Match each reference note to detected onsets (greedy, but with tempo+pitch-aware scoring)
         for i, (ref_note, ref_onset) in enumerate(zip(reference_melody, expected_times)):
             ref_pitch_midi = ref_note['pitch']
-            
-            # Find available onsets within a reasonable time window
-            time_window = 1.0  # seconds
-            available_onsets = []
-            available_indices = []
-            
-            for j, perf_onset in enumerate(onset_times):
-                if j not in used_onsets and abs(perf_onset - ref_onset) <= time_window:
-                    available_onsets.append(perf_onset)
-                    available_indices.append(j)
-            
-            available_onsets = np.array(available_onsets)
-            
-            if len(available_onsets) == 0:
+            # use offset only for candidate search
+            ref_onset_adj = ref_onset + global_offset
+
+            # Gather candidates within window
+            left = ref_onset_adj - time_window
+            right = ref_onset_adj + time_window
+
+            # Fast mask of unused onsets in [left, right]
+            mask = (onset_times >= left) & (onset_times <= right)
+            candidate_indices = [j for j, t in enumerate(onset_times) if mask[j] and j not in used_onsets]
+
+            if not candidate_indices:
                 missed_notes += 1
                 report["note_details"].append({
                     "note_index": i + 1,
                     "expected_pitch": librosa.midi_to_note(ref_pitch_midi),
-                    "expected_time": round(ref_onset, 2),
+                    "expected_time": round(float(ref_onset), 2),
                     "timing_deviation_ms": "MISSED",
                     "pitch_deviation_cents": "MISSED"
                 })
                 continue
-            else:
-                # Normal case - find closest available onset within window
-                available_time_diffs = np.abs(available_onsets - ref_onset)
-                closest_available_idx = np.argmin(available_time_diffs)
-                perf_onset = available_onsets[closest_available_idx]
-                
-                # Mark this onset as used
-                original_idx = available_indices[closest_available_idx]
-                used_onsets.add(original_idx)
-            
-            # Calculate timing deviation
-            timing_deviation_ms = round((perf_onset - ref_onset) * 1000)
-            
-            # Extract pitch at this onset
-            onset_frame = int(perf_onset * self.sample_rate / 512)
-            
-            if onset_frame < len(f0):
-                pitch_window_start = max(0, onset_frame - 5)
-                pitch_window_end = min(len(f0), onset_frame + 15)
-                
-                pitch_segment = f0[pitch_window_start:pitch_window_end]
-                valid_pitches = pitch_segment[~np.isnan(pitch_segment)]
-                
-                if len(valid_pitches) > 0:
-                    detected_pitch_hz = np.median(valid_pitches)
-                    detected_pitch_midi = librosa.hz_to_midi(detected_pitch_hz)
-                    detected_pitch_name = librosa.midi_to_note(detected_pitch_midi)
-                    pitch_deviation_cents = round((detected_pitch_midi - ref_pitch_midi) * 100)
+
+            # Score candidates: primarily time distance (normalized), secondarily pitch cents if available
+            best_j = None
+            best_score = float("inf")
+            best_perf_onset = None
+            best_pitch_name = "UNCLEAR"
+            best_pitch_cents = "UNCLEAR"
+
+            for j in candidate_indices:
+                perf_onset = float(onset_times[j])
+                time_diff = abs(perf_onset - ref_onset_adj)
+                time_norm = time_diff / (time_window + 1e-9)
+
+                det_name, det_midi = _pitch_at_time(perf_onset)
+                if det_midi is not None:
+                    cents = abs((det_midi - ref_pitch_midi) * 100.0)
+                    pitch_norm = min(cents / 100.0, 2.0)  # cap huge errors
+                    # weights: favor timing but use pitch to break ties/near-ties
+                    score = 0.65 * time_norm + 0.35 * pitch_norm
                 else:
-                    detected_pitch_name = "UNCLEAR"
-                    pitch_deviation_cents = "UNCLEAR"
-            else:
-                detected_pitch_name = "UNCLEAR"
-                pitch_deviation_cents = "UNCLEAR"
-            
+                    cents = None
+                    score = time_norm  # fallback: timing only
+
+                if score < best_score:
+                    best_score = score
+                    best_j = j
+                    best_perf_onset = perf_onset
+                    if det_midi is not None:
+                        best_pitch_name = det_name
+                        best_pitch_cents = int(round((det_midi - ref_pitch_midi) * 100.0))
+                    else:
+                        best_pitch_name = "UNCLEAR"
+                        best_pitch_cents = "UNCLEAR"
+
+            # Mark chosen onset as used
+            used_onsets.add(best_j)
+
+            # Timing deviation is reported vs *original* expected time (preserves old semantics)
+            timing_deviation_ms = int(round((best_perf_onset - ref_onset) * 1000.0))
+
             report["note_details"].append({
                 "note_index": i + 1,
                 "expected_pitch": librosa.midi_to_note(ref_pitch_midi),
-                "expected_time": round(ref_onset, 2),
-                "actual_pitch": detected_pitch_name,
-                "actual_time": round(perf_onset, 2),
+                "expected_time": round(float(ref_onset), 2),
+                "actual_pitch": best_pitch_name,
+                "actual_time": round(float(best_perf_onset), 2),
                 "timing_deviation_ms": timing_deviation_ms,
-                "pitch_deviation_cents": pitch_deviation_cents
+                "pitch_deviation_cents": best_pitch_cents
             })
-        
+
         report["metadata"]["detected_notes"] = len(reference_melody) - missed_notes
         report["metadata"]["missed_notes"] = missed_notes
-        
 
         return report
 
