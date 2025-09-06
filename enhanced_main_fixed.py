@@ -11,17 +11,17 @@ This is an improved version of the ABRSM challenge proof-of-concept with:
 - Demo mode for easy testing
 """
 
-import os
-import sys
-import json
-import argparse
-import numpy as np
-import librosa
-import mido
+import os # file handling
+import sys # system operations
+import json # report generation
+import argparse # command-line argument parsing
+import numpy as np # creating the graphs
+import librosa # audio analysis / note detection
+import mido # MIDI file handling MIDI to generate templates (expected vs generated)
 import requests
-from scipy.io import wavfile
-from pathlib import Path
-import traceback
+from scipy.io import wavfile # reformatting to wav files
+from pathlib import Path # file handling 
+import traceback # error handling
 
 # Import our new modules
 try:
@@ -286,8 +286,8 @@ class MusicAnalyzer:
             hop_length = 512
             f0, voiced_flag, voiced_probs = librosa.pyin(
                 y, 
-                fmin=librosa.note_to_hz('C2'), 
-                fmax=librosa.note_to_hz('C6'),
+                fmin=librosa.note_to_hz('A0'), 
+                fmax=librosa.note_to_hz('C8'),
                 hop_length=hop_length
             )
             
