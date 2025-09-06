@@ -271,7 +271,7 @@ class TimeSignatureAnalyzer:
         
         return recommendations
 
-def create_timing_visualization(timing_analysis, output_path="timing_analysis.png"):
+def create_timing_visualization(timing_analysis, output_path="visualizations/timing_analysis.png"):
     """Create a visualization of timing analysis results"""
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))

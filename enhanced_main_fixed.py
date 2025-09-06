@@ -77,8 +77,8 @@ class MusicAnalyzer:
         
     def create_reference_data(self):
         """Enhanced reference generation with better error handling"""
-        midi_path = f"{self.reference_prefix}.mid"
-        wav_path = f"{self.reference_prefix}.wav"
+        midi_path = f"midi/{self.reference_prefix}.mid"
+        wav_path = f"audio/{self.reference_prefix}.wav"
 
         if os.path.exists(midi_path) and os.path.exists(wav_path):
             print(f"✓ Reference files for '{self.piece_info['title']}' already exist.")
@@ -140,7 +140,7 @@ class MusicAnalyzer:
 
     def create_demo_audio(self):
         """Create demo audio - reference melody with one note MISSING (13 notes instead of 14)"""
-        demo_path = "demo_performance.wav"
+        demo_path = "audio/demo_performance.wav"
         
         if os.path.exists(demo_path):
             print(f"✓ Demo audio file already exists: {demo_path}")
@@ -310,6 +310,15 @@ class MusicAnalyzer:
             )
             onset_times = librosa.frames_to_time(onset_frames, sr=self.sample_rate, hop_length=hop_length)
             
+            # CRITICAL FIX: Ensure first note is captured even if onset detection misses it
+            # Check if there's strong signal at the beginning but no early onset detected
+            if len(onset_times) == 0 or (len(onset_times) > 0 and onset_times[0] > 0.1):
+                # Check for audio energy in the first 100ms
+                early_samples = y[:int(0.1 * self.sample_rate)]  # First 100ms
+                if np.max(np.abs(early_samples)) > 0.01:  # If there's significant audio
+                    print("✓ Adding implicit first note onset at time 0.0")
+                    onset_times = np.insert(onset_times, 0, 0.0)
+            
             print(f"✓ Found {len(onset_times)} note onsets")
             print(f"✓ Extracted {np.sum(~np.isnan(f0))} pitch measurements")
             
@@ -321,40 +330,35 @@ class MusicAnalyzer:
             return None, None, None
 
     def compare_performances(self, audio_path, use_digitizer=True):
-        """Enhanced performance comparison with multiple analysis methods (backward-compatible)."""
+        """Enhanced performance comparison with DTW-based sequence alignment."""
         print(f"\n🎯 Comparing performance against '{self.piece_info['title']}'...")
 
         if use_digitizer and ENHANCED_FEATURES_AVAILABLE:
-            # Use new digitizer approach
+            # Use new digitizer approach with DTW alignment
             return self.analyze_performance_with_digitizer(audio_path)
 
-        # Fallback to original method if digitizer not available
+        # Extract performance features using improved method
         onset_times, f0, times = self.analyze_performance_audio(audio_path)
         if onset_times is None:
             return None
 
-        reference_melody = self.piece_info['melody']
-        report = {
-            "metadata": {
-                "piece": self.piece_info['title'],
-                "total_notes": len(reference_melody),
-                "detected_notes": 0,
-                "missed_notes": 0,
-                "analysis_method": "Traditional Onset Detection"
-            },
-            "note_details": []
-        }
+        # Build performance events from onsets and pitch data
+        performance_events = self._extract_note_events(onset_times, f0, times)
+        
+        # Build template events from reference melody
+        template_events = self._build_template_events()
+        
+        # Apply DTW alignment for robust matching
+        alignment = self._align_sequences_dtw(performance_events, template_events)
+        
+        # Generate analysis report from alignment
+        return self._generate_analysis_report(alignment, template_events)
 
-        # tempo-aware expected timings
-        seconds_per_beat = 60.0 / self.tempo
-        expected_times = []
-        current_time = 0.0
-        for note in reference_melody:
-            expected_times.append(current_time)
-            current_time += note['duration'] * 4 * seconds_per_beat
-        expected_times = np.asarray(expected_times, dtype=float)
-
-        #clean & sort onsets; remove near-duplicates (<30 ms)
+    def _extract_note_events(self, onset_times, f0, times):
+        """Extract note events from onset detection and pitch analysis."""
+        events = []
+        
+        # Clean and sort onsets; remove near-duplicates (<30 ms)
         onset_times = np.asarray(onset_times, dtype=float)
         if onset_times.size:
             onset_times = np.sort(onset_times)
@@ -362,134 +366,215 @@ class MusicAnalyzer:
                 diffs = np.diff(onset_times)
                 keep = np.r_[True, diffs >= 0.03]  # 30 ms min separation
                 onset_times = onset_times[keep]
-
-        # tempo-aware window + global offset estimate for fairer matching 
-        # Scale window by tempo (min 80 ms). Default ~0.6 beats works well for slight drift/latency.
-        time_window = max(0.08, 0.6 * seconds_per_beat)
-
-        # Robust global offset: compare first few expected onsets to nearest performance onsets
-        # (used only to aid matching; *reporting* still uses the original expected times)
-        if onset_times.size and expected_times.size:
-            k = int(min(6, onset_times.size, expected_times.size))
-            idx = np.clip(np.searchsorted(onset_times, expected_times[:k]), 0, max(0, onset_times.size - 1))
-            # for border cases, also consider previous candidate and pick closer
-            idx_prev = np.clip(idx - 1, 0, max(0, onset_times.size - 1))
-            best_idxs = np.where(
-                np.abs(onset_times[idx] - expected_times[:k]) <= np.abs(onset_times[idx_prev] - expected_times[:k]),
-                idx, idx_prev
-            )
-            offs = onset_times[best_idxs] - expected_times[:k]
-            global_offset = float(np.median(offs)) if offs.size else 0.0
-            # clamp ridiculous offsets to ~1.5 beats
-            global_offset = float(np.clip(global_offset, -1.5 * seconds_per_beat, 1.5 * seconds_per_beat))
-        else:
-            global_offset = 0.0
-
-        used_onsets = set()
-        missed_notes = 0
-
-        # Helper to get pitch stats around a given onset time (uses 'times' when available)
-        def _pitch_at_time(t_sec):
-            # prefer index via 'times' to avoid assuming hop_length
-            if times is not None and len(times):
-                onset_idx = int(np.searchsorted(times, t_sec))
-            else:
-                # fallback to original 512-hop assumption
-                onset_idx = int(t_sec * getattr(self, "sample_rate", 22050) / 512)
-
-            if onset_idx < 0 or f0 is None or onset_idx >= len(f0):
-                return None, None  # (detected_name, midi)
-
-            s = max(0, onset_idx - 5)
-            e = min(len(f0), onset_idx + 15)
-            seg = f0[s:e]
-            if seg is None or len(seg) == 0:
-                return None, None
-            seg = seg[~np.isnan(seg)]
-            if len(seg) == 0:
-                return None, None
-
-            detected_hz = float(np.nanmedian(seg))
-            detected_midi = float(librosa.hz_to_midi(detected_hz))
-            detected_name = librosa.midi_to_note(detected_midi)
-            return detected_name, detected_midi
-
-        # Match each reference note to detected onsets (greedy, but with tempo+pitch-aware scoring)
-        for i, (ref_note, ref_onset) in enumerate(zip(reference_melody, expected_times)):
-            ref_pitch_midi = ref_note['pitch']
-            # use offset only for candidate search
-            ref_onset_adj = ref_onset + global_offset
-
-            # Gather candidates within window
-            left = ref_onset_adj - time_window
-            right = ref_onset_adj + time_window
-
-            # Fast mask of unused onsets in [left, right]
-            mask = (onset_times >= left) & (onset_times <= right)
-            candidate_indices = [j for j, t in enumerate(onset_times) if mask[j] and j not in used_onsets]
-
-            if not candidate_indices:
-                missed_notes += 1
-                report["note_details"].append({
-                    "note_index": i + 1,
-                    "expected_pitch": librosa.midi_to_note(ref_pitch_midi),
-                    "expected_time": round(float(ref_onset), 2),
-                    "timing_deviation_ms": "MISSED",
-                    "pitch_deviation_cents": "MISSED"
+        
+        for onset_time in onset_times:
+            # Get pitch information around this onset
+            pitch_info = self._get_pitch_at_time(onset_time, f0, times)
+            if pitch_info:
+                events.append({
+                    'time': float(onset_time),
+                    'pitch_hz': pitch_info['hz'],
+                    'pitch_midi': pitch_info['midi'],
+                    'pitch_name': pitch_info['name']
                 })
-                continue
+        
+        return events
 
-            # Score candidates: primarily time distance (normalized), secondarily pitch cents if available
-            best_j = None
-            best_score = float("inf")
-            best_perf_onset = None
-            best_pitch_name = "UNCLEAR"
-            best_pitch_cents = "UNCLEAR"
+    def _get_pitch_at_time(self, t_sec, f0, times):
+        """Get pitch statistics around a given onset time."""
+        if times is not None and len(times):
+            onset_idx = int(np.searchsorted(times, t_sec))
+        else:
+            # fallback to 512-hop assumption
+            onset_idx = int(t_sec * getattr(self, "sample_rate", 22050) / 512)
 
-            for j in candidate_indices:
-                perf_onset = float(onset_times[j])
-                time_diff = abs(perf_onset - ref_onset_adj)
-                time_norm = time_diff / (time_window + 1e-9)
+        if onset_idx < 0 or f0 is None or onset_idx >= len(f0):
+            return None
 
-                det_name, det_midi = _pitch_at_time(perf_onset)
-                if det_midi is not None:
-                    cents = abs((det_midi - ref_pitch_midi) * 100.0)
-                    pitch_norm = min(cents / 100.0, 2.0)  # cap huge errors
-                    # weights: favor timing but use pitch to break ties/near-ties
-                    score = 0.65 * time_norm + 0.35 * pitch_norm
+        # Analyze pitch in a window around the onset
+        s = max(0, onset_idx - 5)
+        e = min(len(f0), onset_idx + 15)
+        seg = f0[s:e]
+        if seg is None or len(seg) == 0:
+            return None
+        seg = seg[~np.isnan(seg)]
+        if len(seg) == 0:
+            return None
+
+        detected_hz = float(np.nanmedian(seg))
+        detected_midi = float(librosa.hz_to_midi(detected_hz))
+        detected_name = librosa.midi_to_note(detected_midi)
+        
+        return {
+            'hz': detected_hz,
+            'midi': detected_midi,
+            'name': detected_name
+        }
+
+    def _build_template_events(self):
+        """Build template events from reference melody."""
+        events = []
+        seconds_per_beat = 60.0 / self.tempo
+        current_time = 0.0
+        
+        for i, note in enumerate(self.piece_info['melody']):
+            events.append({
+                'time': float(current_time),
+                'pitch_midi': note['pitch'],
+                'pitch_name': librosa.midi_to_note(note['pitch']),
+                'duration': note['duration'] * 4 * seconds_per_beat,
+                'note_index': i + 1
+            })
+            current_time += note['duration'] * 4 * seconds_per_beat
+        
+        return events
+
+    def _align_sequences_dtw(self, performance_events, template_events):
+        """Align performance and template sequences using Dynamic Time Warping."""
+        n, m = len(performance_events), len(template_events)
+        
+        if n == 0 or m == 0:
+            return {
+                'matched_pairs': [],
+                'performance_extra': performance_events[:],
+                'template_missed': template_events[:]
+            }
+        
+        print(f"DTW: Aligning {n} performance events with {m} template events")
+        
+        # Initialize DTW matrix
+        dtw_matrix = np.full((n + 1, m + 1), np.inf)
+        dtw_matrix[0, 0] = 0
+        
+        # Allow free insertion at the beginning (performance can start late)
+        for i in range(1, n + 1):
+            dtw_matrix[i, 0] = i * 0.5  # Small penalty for extra notes at start
+        
+        # Allow free deletion at the beginning (template can have missing notes at start)
+        for j in range(1, m + 1):
+            dtw_matrix[0, j] = j * 0.5  # Small penalty for missed notes at start
+
+        # Fill DTW matrix with pitch-aware cost function
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                cost = self._note_cost_function(performance_events[i-1], template_events[j-1])
+                
+                # Standard DTW transitions with different penalties
+                insertion_cost = dtw_matrix[i-1, j] + 1.0      # Extra performance note
+                deletion_cost = dtw_matrix[i, j-1] + 1.0       # Missed template note  
+                match_cost = dtw_matrix[i-1, j-1] + cost       # Match/substitution
+                
+                dtw_matrix[i, j] = min(insertion_cost, deletion_cost, match_cost)
+
+        print(f"DTW cost: {dtw_matrix[n, m]:.2f}")
+
+        # Backtrack to find alignment path
+        matched_pairs = []
+        performance_extra = []
+        template_missed = []
+        
+        i, j = n, m
+        while i > 0 or j > 0:
+            if i > 0 and j > 0:
+                # Find which path was taken
+                current_cost = dtw_matrix[i, j]
+                match_cost = dtw_matrix[i-1, j-1] + self._note_cost_function(performance_events[i-1], template_events[j-1])
+                insertion_cost = dtw_matrix[i-1, j] + 1.0
+                deletion_cost = dtw_matrix[i, j-1] + 1.0
+                
+                if abs(current_cost - match_cost) < 1e-9:
+                    # Match/substitution path
+                    matched_pairs.append((performance_events[i-1], template_events[j-1]))
+                    i, j = i-1, j-1
+                elif abs(current_cost - insertion_cost) < 1e-9:
+                    # Insertion path (extra performance note)
+                    performance_extra.append(performance_events[i-1])
+                    i -= 1
                 else:
-                    cents = None
-                    score = time_norm  # fallback: timing only
+                    # Deletion path (missed template note)
+                    template_missed.append(template_events[j-1])
+                    j -= 1
+            elif i > 0:
+                performance_extra.append(performance_events[i-1])
+                i -= 1
+            else:
+                template_missed.append(template_events[j-1])
+                j -= 1
+        
+        print(f"Alignment result: {len(matched_pairs)} matches, {len(performance_extra)} extra, {len(template_missed)} missed")
+        
+        return {
+            'matched_pairs': matched_pairs[::-1],  # Reverse to get correct order
+            'performance_extra': performance_extra[::-1],
+            'template_missed': template_missed[::-1]
+        }
 
-                if score < best_score:
-                    best_score = score
-                    best_j = j
-                    best_perf_onset = perf_onset
-                    if det_midi is not None:
-                        best_pitch_name = det_name
-                        best_pitch_cents = int(round((det_midi - ref_pitch_midi) * 100.0))
-                    else:
-                        best_pitch_name = "UNCLEAR"
-                        best_pitch_cents = "UNCLEAR"
+    def _note_cost_function(self, perf_event, template_event):
+        """Calculate cost between a performance event and template event."""
+        # Time difference component (more lenient for better alignment)
+        seconds_per_beat = 60.0 / self.tempo
+        time_diff = abs(perf_event['time'] - template_event['time'])
+        
+        # More lenient time window - allow up to 1 beat difference
+        time_cost = min(time_diff / (1.0 * seconds_per_beat), 1.5)
+        
+        # Pitch difference component (in semitones) - exact matches should have very low cost
+        pitch_diff = abs(perf_event['pitch_midi'] - template_event['pitch_midi'])
+        if pitch_diff == 0:
+            pitch_cost = 0.0  # Perfect pitch match
+        else:
+            pitch_cost = min(pitch_diff / 6.0, 1.5)  # More lenient for pitch differences
+        
+        # For very close timing (within 0.3 beats) and exact pitch, heavily favor this match
+        if time_diff < (0.3 * seconds_per_beat) and pitch_diff == 0:
+            return 0.1  # Very low cost for good matches
+        
+        # Combined cost - favor pitch accuracy more for better note identification
+        return 0.3 * time_cost + 0.7 * pitch_cost
 
-            # Mark chosen onset as used
-            used_onsets.add(best_j)
+    def _generate_analysis_report(self, alignment, template_events):
+        """Generate analysis report from DTW alignment results."""
+        reference_melody = self.piece_info['melody']
+        
+        report = {
+            "metadata": {
+                "piece": self.piece_info['title'],
+                "total_notes": len(reference_melody),
+                "detected_notes": len(alignment['matched_pairs']),
+                "missed_notes": len(alignment['template_missed']),
+                "extra_notes": len(alignment['performance_extra']),
+                "analysis_method": "DTW Sequence Alignment"
+            },
+            "note_details": []
+        }
 
-            # Timing deviation is reported vs *original* expected time (preserves old semantics)
-            timing_deviation_ms = int(round((best_perf_onset - ref_onset) * 1000.0))
-
+        # Process matched pairs
+        for perf_event, template_event in alignment['matched_pairs']:
+            timing_deviation_ms = int(round((perf_event['time'] - template_event['time']) * 1000.0))
+            pitch_deviation_cents = int(round((perf_event['pitch_midi'] - template_event['pitch_midi']) * 100.0))
+            
             report["note_details"].append({
-                "note_index": i + 1,
-                "expected_pitch": librosa.midi_to_note(ref_pitch_midi),
-                "expected_time": round(float(ref_onset), 2),
-                "actual_pitch": best_pitch_name,
-                "actual_time": round(float(best_perf_onset), 2),
+                "note_index": template_event['note_index'],
+                "expected_pitch": template_event['pitch_name'],
+                "expected_time": round(template_event['time'], 2),
+                "actual_pitch": perf_event['pitch_name'],
+                "actual_time": round(perf_event['time'], 2),
                 "timing_deviation_ms": timing_deviation_ms,
-                "pitch_deviation_cents": best_pitch_cents
+                "pitch_deviation_cents": pitch_deviation_cents
             })
 
-        report["metadata"]["detected_notes"] = len(reference_melody) - missed_notes
-        report["metadata"]["missed_notes"] = missed_notes
+        # Process missed notes
+        for template_event in alignment['template_missed']:
+            report["note_details"].append({
+                "note_index": template_event['note_index'],
+                "expected_pitch": template_event['pitch_name'],
+                "expected_time": round(template_event['time'], 2),
+                "timing_deviation_ms": "MISSED",
+                "pitch_deviation_cents": "MISSED"
+            })
+
+        # Sort by note index to maintain order
+        report["note_details"].sort(key=lambda x: x["note_index"])
 
         return report
 
@@ -590,7 +675,7 @@ def main():
         if not analyzer.create_demo_audio():
             print("❌ Failed to create demo audio")
             sys.exit(1)
-        performance_path = "demo_performance.wav"
+        performance_path = "audio/demo_performance.wav"
     else:
         performance_path = args.performance
     
@@ -617,12 +702,12 @@ def main():
     if ENHANCED_FEATURES_AVAILABLE and not args.no_visualizations:
         try:
             # Sheet music visualization
-            vis_path = create_visual_analysis(performance_path, f"{analyzer.reference_prefix}.wav", report)
+            vis_path = create_visual_analysis(performance_path, f"audio/{analyzer.reference_prefix}.wav", report)
             if vis_path:
                 print(f"✓ Sheet music visualization: {vis_path}")
             
             # Timing analysis
-            timing_path = create_timing_visualization(report, f"timing_analysis_{args.piece}.png")
+            timing_path = create_timing_visualization(report, f"visualizations/timing_analysis_{args.piece}.png")
             if timing_path:
                 print(f"✓ Timing analysis: {timing_path}")
                 

@@ -46,7 +46,7 @@ class SheetMusicVisualizer:
         return self.note_to_line.get(note_name, 1)  # Default to G4 if not found
 
     def create_sheet_music_visualization(self, reference_melody, performance_data, 
-                                       output_path="sheet_music_diff.png", 
+                                       output_path="visualizations/sheet_music_diff.png", 
                                        time_signature=(4, 4)):
         """
         Create a sheet music visualization showing reference vs performance with diffs
@@ -250,7 +250,7 @@ def create_visual_analysis(reference_melody, performance_report, time_signature=
     else:
         performance_data = performance_report
     
-    output_path = "sheet_music_analysis.png"
+    output_path = "visualizations/sheet_music_analysis.png"
     return visualizer.create_sheet_music_visualization(
         reference_melody, performance_data, output_path, time_signature
     )

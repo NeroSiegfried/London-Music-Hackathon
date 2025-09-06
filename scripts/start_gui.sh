@@ -7,6 +7,9 @@ echo "🎵 ABRSM AI Music Feedback System"
 echo "Starting GUI interface..."
 echo
 
+# Change to project directory
+cd "$(dirname "$0")/.."
+
 # Check if virtual environment exists
 if [ ! -d "venv" ]; then
     echo "❌ Virtual environment not found!"
@@ -29,6 +32,6 @@ fi
 
 # Launch GUI
 echo "🚀 Launching GUI..."
-python launch_gui.py
+python enhanced_gui_interface.py
 
 echo "👋 GUI session ended"
