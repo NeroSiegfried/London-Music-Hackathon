@@ -640,18 +640,38 @@ class EnhancedABRSMGUI:
             if i < len(note_details):
                 note_detail = note_details[i]
             
-            # Calculate note position on staff
-            midi_pitch = note_data['pitch']
-            # C4 (MIDI 60) is on ledger line below staff
-            y_pos = staff_y + (midi_pitch - 60) * 0.25
+            # Calculate note position on staff - fix the MIDI pitch conversion
+            midi_pitch = note_data.get('pitch', 60)
+            if isinstance(midi_pitch, str):
+                # Handle note names like 'C4', 'G4', etc.
+                note_to_midi = {'C': 60, 'D': 62, 'E': 64, 'F': 65, 'G': 67, 'A': 69, 'B': 71}
+                try:
+                    base_note = midi_pitch[0]
+                    octave = int(midi_pitch[-1]) if midi_pitch[-1].isdigit() else 4
+                    midi_pitch = note_to_midi.get(base_note, 60) + (octave - 4) * 12
+                except:
+                    midi_pitch = 60  # Default to C4
+            
+            # Convert MIDI pitch to staff position
+            # C4 (MIDI 60) = position 0, each semitone = 0.125 staff positions
+            # Map to treble clef staff: E4 (64) = line 1, G4 (67) = line 2, etc.
+            staff_position = (midi_pitch - 64) * 0.125  # E4 = 0 (bottom line)
+            y_pos = staff_y + staff_position
             
             # Determine color based on view type and analysis
             if view_type == "template":
-                # Template view: show missed notes in red, others in black
-                if note_detail and note_detail.get('timing_deviation_ms') == 'MISSED':
-                    color = 'red'
+                # Template view: color code based on whether note was missed in performance
+                if note_detail:
+                    if note_detail.get('timing_deviation_ms') == 'MISSED':
+                        color = 'red'  # This note was missed
+                    elif note_detail.get('accuracy') == 'excellent':
+                        color = 'green'  # This note was played well
+                    elif note_detail.get('accuracy') in ['good', 'poor']:
+                        color = 'orange'  # This note had issues
+                    else:
+                        color = 'black'  # Default template color
                 else:
-                    color = 'black'
+                    color = 'black'  # Default template color
             else:
                 # Performance view: color code based on accuracy
                 if note_detail:
@@ -661,8 +681,12 @@ class EnhancedABRSMGUI:
                         color = 'orange'  # Timing issues
                     elif isinstance(note_detail.get('pitch_deviation_cents'), (int, float)) and abs(note_detail.get('pitch_deviation_cents', 0)) > 50:
                         color = 'blue'  # Pitch issues
-                    else:
+                    elif note_detail.get('accuracy') == 'excellent':
                         color = 'green'  # Correct
+                    elif note_detail.get('accuracy') in ['good', 'poor']:
+                        color = 'orange'  # Needs work
+                    else:
+                        color = 'green'  # Default good
                 else:
                     color = 'purple'  # Extra notes
             
@@ -1713,7 +1737,80 @@ This analysis looks for sections where the performer may have:
         """Stop audio playback"""
         pygame.mixer.music.stop()
     
+    def generate_and_play_reference(self, piece_info):
+        """Generate and play reference audio from piece melody data"""
+        try:
+            melody = piece_info.get('melody', [])
+            if not melody:
+                messagebox.showwarning("Warning", "No melody data available")
+                return
+            
+            # Generate audio from melody
+            sr = 22050
+            total_duration = sum(note.get('duration', 0.5) for note in melody)
+            audio = np.zeros(int(sr * (total_duration + 1.0)))  # Add 1 second buffer
+            
+            current_time = 0.0
+            for note in melody:
+                # Get note parameters
+                pitch = note.get('pitch', 60)
+                duration = note.get('duration', 0.5)
+                velocity = note.get('velocity', 80) / 127.0  # Normalize to 0-1
+                
+                # Convert MIDI pitch to frequency
+                freq = librosa.midi_to_hz(pitch)
+                
+                # Generate note audio
+                note_samples = int(sr * duration)
+                t = np.linspace(0, duration, note_samples)
+                
+                # Create harmonic tone
+                note_audio = velocity * np.sin(2 * np.pi * freq * t)
+                note_audio += velocity * 0.3 * np.sin(2 * np.pi * freq * 2 * t)  # 2nd harmonic
+                note_audio += velocity * 0.1 * np.sin(2 * np.pi * freq * 3 * t)  # 3rd harmonic
+                
+                # Apply envelope
+                attack_samples = int(0.05 * sr)  # 50ms attack
+                release_samples = int(0.1 * sr)  # 100ms release
+                
+                if len(note_audio) > attack_samples + release_samples:
+                    # Attack
+                    note_audio[:attack_samples] *= np.linspace(0, 1, attack_samples)
+                    # Release
+                    note_audio[-release_samples:] *= np.linspace(1, 0, release_samples)
+                
+                # Add to main audio
+                start_sample = int(current_time * sr)
+                end_sample = start_sample + len(note_audio)
+                if end_sample <= len(audio):
+                    audio[start_sample:end_sample] += note_audio
+                
+                current_time += duration
+            
+            # Normalize audio
+            if np.max(np.abs(audio)) > 0:
+                audio = audio / np.max(np.abs(audio)) * 0.8
+            
+            # Save temporary file and play
+            import soundfile as sf
+            temp_path = "temp_reference.wav"
+            sf.write(temp_path, audio, sr)
+            
+            pygame.mixer.music.stop()
+            pygame.mixer.music.load(temp_path)
+            pygame.mixer.music.play()
+            
+            print(f"🎵 Playing reference audio: {piece_info.get('title', 'Reference')}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not generate reference audio: {str(e)}")
+            print(f"Reference generation error: {e}")
+    
     # Utility methods
+    def update_status(self, message):
+        """Update status message (placeholder for status bar)"""
+        print(f"📱 Status: {message}")  # For now, just print to console
+        # In a full implementation, this would update a status bar widget
     def _pitch_to_frequency(self, pitch_name):
         """Convert pitch name to frequency"""
         try:
