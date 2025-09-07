@@ -28,6 +28,7 @@ from pathlib import Path
 import pygame
 import librosa
 import soundfile as sf
+import requests
 
 # Import existing modules
 try:
@@ -186,17 +187,87 @@ class EnhancedABRSMGUI:
         
         if os.path.exists(midi_folder):
             for filename in os.listdir(midi_folder):
-                if filename.endswith('.mid') or filename.endswith('.midi'):
+                if filename.endswith(('.mid', '.midi', '.mxl')):
                     # Extract piece name from filename
-                    piece_name = filename.replace('.mid', '').replace('.midi', '').replace('_reference', '')
+                    piece_name = filename.replace('.mid', '').replace('.midi', '').replace('.mxl', '').replace('_reference', '')
                     piece_key = piece_name.lower().replace(' ', '_').replace('-', '_')
+                    
+                    # Skip if we already have this piece
+                    if piece_key in self.available_pieces:
+                        continue
                     
                     # Create a basic piece structure
                     self.available_pieces[piece_key] = {
                         'title': piece_name.replace('_', ' ').title(),
                         'midi_file': os.path.join(midi_folder, filename),
-                        'melody': []  # Will be populated from MIDI if needed
+                        'melody': []  # Will be populated from MIDI/MXL if needed
                     }
+                    
+                    # Try to extract melody data immediately
+                    try:
+                        if filename.endswith('.mxl'):
+                            melody = self._extract_melody_from_mxl(os.path.join(midi_folder, filename))
+                        else:
+                            melody = self.extract_melody_from_midi(piece_key)
+                        
+                        if melody:
+                            self.available_pieces[piece_key]['melody'] = melody
+                    except Exception as e:
+                        print(f"Warning: Could not extract melody from {filename}: {e}")
+            
+            # Add some default pieces if PIECES is available
+            if MUSIC_ANALYZER_AVAILABLE and PIECES:
+                for key, piece_data in PIECES.items():
+                    if key not in self.available_pieces:
+                        self.available_pieces[key] = piece_data
+    
+    def _extract_melody_from_mxl(self, mxl_path):
+        """Extract melody from MusicXML (.mxl) file"""
+        try:
+            # Try to use music21 if available
+            try:
+                import music21
+                
+                # Load the MusicXML file
+                score = music21.converter.parse(mxl_path)
+                
+                # Get the first part (melody line)
+                melody_part = None
+                for part in score.parts:
+                    if part.notes:
+                        melody_part = part
+                        break
+                
+                if not melody_part:
+                    return []
+                
+                melody = []
+                current_time = 0.0
+                
+                for element in melody_part.flat.notesAndRests:
+                    if isinstance(element, music21.note.Note):
+                        melody.append({
+                            'pitch': element.pitch.midi,
+                            'duration': float(element.duration.quarterLength),
+                            'time': current_time
+                        })
+                    elif isinstance(element, music21.note.Rest):
+                        # Skip rests or add them as needed
+                        pass
+                    
+                    if hasattr(element, 'duration'):
+                        current_time += float(element.duration.quarterLength)
+                
+                return melody[:32]  # Limit to first 32 notes for display
+                
+            except ImportError:
+                # Fallback: try to convert MXL to MIDI first
+                print("music21 not available, trying MIDI conversion...")
+                return []
+                
+        except Exception as e:
+            print(f"Error extracting melody from MXL: {e}")
+            return []
         
         # Merge with existing PIECES if available
         if MODULES_AVAILABLE and hasattr(sys.modules[__name__], 'PIECES'):
@@ -289,9 +360,12 @@ class EnhancedABRSMGUI:
         piece_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         
         ttk.Label(piece_frame, text="Reference Piece:").pack(side=tk.LEFT)
-        self.piece_var = tk.StringVar(value=list(self.available_pieces.keys())[0] if self.available_pieces else "twinkle")
+        # Set default value safely
+        piece_keys = list(self.available_pieces.keys())
+        default_piece = piece_keys[0] if piece_keys else "twinkle"
+        self.piece_var = tk.StringVar(value=default_piece)
         piece_combo = ttk.Combobox(piece_frame, textvariable=self.piece_var, 
-                                   values=list(self.available_pieces.keys()), state='readonly')
+                                   values=piece_keys, state='readonly')
         piece_combo.pack(side=tk.LEFT, padx=(10, 0))
         
         # Analysis buttons
@@ -550,14 +624,19 @@ class EnhancedABRSMGUI:
         try:
             self.sheet_fig.clear()
             
-            if self.current_analysis and MODULES_AVAILABLE:
+            if self.current_analysis:
                 # Create two subplots: template and performance
-                gs = self.sheet_fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
+                gs = self.sheet_fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.4)
                 
                 # Get current piece info
                 piece_key = self.piece_var.get()
-                piece_info = PIECES.get(piece_key, {})
+                piece_info = self.available_pieces.get(piece_key, {})
                 reference_melody = piece_info.get('melody', [])
+                
+                # If no melody in available pieces, try PIECES
+                if not reference_melody and MUSIC_ANALYZER_AVAILABLE:
+                    piece_info = PIECES.get(piece_key, {})
+                    reference_melody = piece_info.get('melody', [])
                 
                 if reference_melody and self.current_analysis:
                     # Get analysis data
@@ -591,7 +670,7 @@ class EnhancedABRSMGUI:
                 else:
                     # Fallback display
                     ax = self.sheet_fig.add_subplot(111)
-                    ax.text(0.5, 0.5, f"No melody data available for {piece_key}\nLoad a piece with melody data", 
+                    ax.text(0.5, 0.5, f"No melody data available for {piece_key}\nTry selecting a different piece or load a MIDI/MXL file", 
                            ha='center', va='center', fontsize=12, transform=ax.transAxes)
                     ax.axis('off')
             else:
@@ -618,21 +697,30 @@ class EnhancedABRSMGUI:
             self.sheet_canvas.draw()
     
     def _draw_sheet_music(self, ax, melody_data, note_details, view_type):
-        """Draw sheet music notation with color coding"""
-        # Draw staff lines
-        staff_y = 2
-        staff_width = len(melody_data) * 0.8 + 2
+        """Draw sheet music notation with color coding - FIXED VERSION"""
+        if not melody_data:
+            ax.text(0.5, 0.5, "No melody data to display", ha='center', va='center', transform=ax.transAxes)
+            ax.axis('off')
+            return
+            
+        # Staff setup
+        staff_center_y = 3.0  # Center of the staff
+        staff_line_spacing = 0.4  # Space between staff lines
+        staff_width = max(8, len(melody_data) * 0.8 + 2)
         
+        # Draw staff lines (5 lines from bottom to top)
+        staff_lines_y = []
         for i in range(5):
-            y = staff_y + i * 0.5
-            ax.plot([0.5, staff_width], [y, y], color='black', linewidth=1)
+            y_pos = staff_center_y + (i - 2) * staff_line_spacing  # Lines at y = 2.2, 2.6, 3.0, 3.4, 3.8
+            staff_lines_y.append(y_pos)
+            ax.plot([0.5, staff_width], [y_pos, y_pos], color='black', linewidth=1.5)
         
-        # Draw treble clef
-        ax.text(0.7, staff_y + 1, '𝄞', fontsize=30, va='center', ha='center')
+        # Draw treble clef at the beginning
+        ax.text(0.8, staff_center_y, '𝄞', fontsize=40, va='center', ha='center', fontweight='bold')
         
         # Draw notes
-        x_pos = 1.5
-        note_spacing = 0.8
+        x_pos = 1.8  # Start after treble clef
+        note_spacing = 0.7
         
         for i, note_data in enumerate(melody_data):
             # Get analysis info for this note
@@ -640,78 +728,123 @@ class EnhancedABRSMGUI:
             if i < len(note_details):
                 note_detail = note_details[i]
             
-            # Calculate note position on staff - fix the MIDI pitch conversion
+            # Extract pitch - handle different formats
             midi_pitch = note_data.get('pitch', 60)
+            
+            # Convert string pitches to MIDI numbers
             if isinstance(midi_pitch, str):
-                # Handle note names like 'C4', 'G4', etc.
-                note_to_midi = {'C': 60, 'D': 62, 'E': 64, 'F': 65, 'G': 67, 'A': 69, 'B': 71}
                 try:
-                    base_note = midi_pitch[0]
-                    octave = int(midi_pitch[-1]) if midi_pitch[-1].isdigit() else 4
-                    midi_pitch = note_to_midi.get(base_note, 60) + (octave - 4) * 12
+                    midi_pitch = librosa.note_to_hz(midi_pitch)
+                    midi_pitch = librosa.hz_to_midi(midi_pitch)
                 except:
-                    midi_pitch = 60  # Default to C4
+                    # Manual conversion for common note names
+                    note_to_midi_map = {
+                        'C4': 60, 'D4': 62, 'E4': 64, 'F4': 65, 'G4': 67, 'A4': 69, 'B4': 71,
+                        'C5': 72, 'D5': 74, 'E5': 76, 'F5': 77, 'G5': 79, 'A5': 81, 'B5': 83
+                    }
+                    midi_pitch = note_to_midi_map.get(str(midi_pitch), 60)
             
-            # Convert MIDI pitch to staff position
-            # C4 (MIDI 60) = position 0, each semitone = 0.125 staff positions
-            # Map to treble clef staff: E4 (64) = line 1, G4 (67) = line 2, etc.
-            staff_position = (midi_pitch - 64) * 0.125  # E4 = 0 (bottom line)
-            y_pos = staff_y + staff_position
+            # Calculate note position on staff
+            # Middle C (C4 = MIDI 60) is below the staff
+            # E4 (MIDI 64) = bottom line of treble staff
+            # Reference: E4=64 is bottom line (y=2.2), each semitone = 0.1 units
             
-            # Determine color based on view type and analysis
+            note_offset_from_e4 = midi_pitch - 64  # E4 is our reference (bottom line)
+            y_pos = staff_lines_y[0] + (note_offset_from_e4 * 0.1)  # Each semitone moves 0.1 units up
+            
+            # Determine note color based on analysis
             if view_type == "template":
-                # Template view: color code based on whether note was missed in performance
+                # Template view: show in black, but highlight issues from performance
                 if note_detail:
-                    if note_detail.get('timing_deviation_ms') == 'MISSED':
-                        color = 'red'  # This note was missed
-                    elif note_detail.get('accuracy') == 'excellent':
-                        color = 'green'  # This note was played well
-                    elif note_detail.get('accuracy') in ['good', 'poor']:
-                        color = 'orange'  # This note had issues
+                    pitch_error = note_detail.get('pitch_deviation_cents', 0)
+                    timing_error = note_detail.get('timing_deviation_ms', 0)
+                    
+                    # Color code based on whether this note had issues in performance
+                    if (isinstance(pitch_error, (int, float)) and abs(pitch_error) > 50) or \
+                       (isinstance(timing_error, (int, float)) and abs(timing_error) > 100):
+                        color = 'red'  # This note will be problematic
+                    elif (isinstance(pitch_error, (int, float)) and abs(pitch_error) > 25) or \
+                         (isinstance(timing_error, (int, float)) and abs(timing_error) > 50):
+                        color = 'orange'  # Moderate difficulty
                     else:
-                        color = 'black'  # Default template color
+                        color = 'darkgreen'  # Should be easy
                 else:
                     color = 'black'  # Default template color
-            else:
-                # Performance view: color code based on accuracy
+                    
+            else:  # Performance view
                 if note_detail:
-                    if note_detail.get('timing_deviation_ms') == 'MISSED':
-                        continue  # Don't draw missed notes in performance view
-                    elif isinstance(note_detail.get('timing_deviation_ms'), (int, float)) and abs(note_detail.get('timing_deviation_ms', 0)) > 100:
-                        color = 'orange'  # Timing issues
-                    elif isinstance(note_detail.get('pitch_deviation_cents'), (int, float)) and abs(note_detail.get('pitch_deviation_cents', 0)) > 50:
-                        color = 'blue'  # Pitch issues
-                    elif note_detail.get('accuracy') == 'excellent':
-                        color = 'green'  # Correct
-                    elif note_detail.get('accuracy') in ['good', 'poor']:
-                        color = 'orange'  # Needs work
+                    pitch_error = note_detail.get('pitch_deviation_cents', 0)
+                    timing_error = note_detail.get('timing_deviation_ms', 0)
+                    
+                    # Skip missed notes or use gray
+                    if str(timing_error) == 'MISSED' or str(pitch_error) == 'MISSED':
+                        color = 'lightgray'
+                        alpha = 0.3
+                    elif isinstance(pitch_error, (int, float)) and isinstance(timing_error, (int, float)):
+                        # Color based on accuracy
+                        total_error = abs(pitch_error) / 25 + abs(timing_error) / 50
+                        if total_error < 1.0:
+                            color = 'darkgreen'  # Excellent
+                        elif total_error < 2.0:
+                            color = 'blue'       # Good
+                        elif total_error < 4.0:
+                            color = 'orange'     # Fair
+                        else:
+                            color = 'red'        # Poor
+                        alpha = 0.8
                     else:
-                        color = 'green'  # Default good
+                        color = 'purple'  # Extra or unanalyzed notes
+                        alpha = 0.6
                 else:
-                    color = 'purple'  # Extra notes
+                    color = 'purple'  # Extra notes not in template
+                    alpha = 0.6
             
-            # Draw note head
-            circle = plt.Circle((x_pos, y_pos), 0.12, color=color, fill=True)
+            # Draw note head (filled circle)
+            note_size = 0.15
+            if view_type == "performance" and color == 'lightgray':
+                # Draw hollow note for missed notes
+                circle = plt.Circle((x_pos, y_pos), note_size, 
+                                  facecolor='none', edgecolor=color, linewidth=2, alpha=alpha)
+            else:
+                circle = plt.Circle((x_pos, y_pos), note_size, 
+                                  facecolor=color, edgecolor='black', linewidth=1)
             ax.add_patch(circle)
             
             # Draw stem
-            stem_height = 1.5 if y_pos < staff_y + 2 else -1.5
-            stem_x = x_pos + (0.12 if stem_height > 0 else -0.12)
-            ax.plot([stem_x, stem_x], [y_pos, y_pos + stem_height], color=color, linewidth=2)
+            stem_height = 1.2
+            stem_direction = 1 if y_pos < staff_center_y else -1  # Stems up for low notes, down for high notes
+            stem_x = x_pos + (note_size if stem_direction > 0 else -note_size)
+            stem_start_y = y_pos
+            stem_end_y = y_pos + (stem_height * stem_direction)
             
-            # Add ledger lines if needed
-            if y_pos < staff_y - 0.1:
-                for ledger_y in np.arange(staff_y - 0.5, y_pos - 0.1, -0.5):
-                    ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
-            elif y_pos > staff_y + 2.1:
-                for ledger_y in np.arange(staff_y + 2.5, y_pos + 0.1, 0.5):
-                    ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
+            ax.plot([stem_x, stem_x], [stem_start_y, stem_end_y], 
+                   color=color if color != 'lightgray' else 'gray', linewidth=2)
+            
+            # Add ledger lines for notes outside staff
+            if y_pos < staff_lines_y[0] - 0.1:  # Below staff
+                ledger_y = staff_lines_y[0] - staff_line_spacing
+                while ledger_y > y_pos - 0.1:
+                    ax.plot([x_pos - 0.25, x_pos + 0.25], [ledger_y, ledger_y], 
+                           color='black', linewidth=1.5)
+                    ledger_y -= staff_line_spacing
+                    
+            elif y_pos > staff_lines_y[4] + 0.1:  # Above staff
+                ledger_y = staff_lines_y[4] + staff_line_spacing
+                while ledger_y < y_pos + 0.1:
+                    ax.plot([x_pos - 0.25, x_pos + 0.25], [ledger_y, ledger_y], 
+                           color='black', linewidth=1.5)
+                    ledger_y += staff_line_spacing
+            
+            # Add note number below staff for debugging/reference
+            if view_type == "template":
+                ax.text(x_pos, staff_lines_y[0] - 0.6, str(i+1), 
+                       ha='center', va='center', fontsize=8, color='gray')
             
             x_pos += note_spacing
         
         # Set axis properties
         ax.set_xlim(0, staff_width + 0.5)
-        ax.set_ylim(staff_y - 2, staff_y + 4.5)
+        ax.set_ylim(staff_lines_y[0] - 1.5, staff_lines_y[4] + 1.5)
         ax.set_aspect('equal')
         ax.axis('off')
     
@@ -721,7 +854,12 @@ class EnhancedABRSMGUI:
             if piece_key in self.available_pieces and 'midi_file' in self.available_pieces[piece_key]:
                 midi_path = self.available_pieces[piece_key]['midi_file']
                 if os.path.exists(midi_path):
-                    import mido
+                    try:
+                        import mido
+                    except ImportError:
+                        print("mido not available for MIDI parsing")
+                        return None
+                        
                     mid = mido.MidiFile(midi_path)
                     
                     melody = []
@@ -729,25 +867,62 @@ class EnhancedABRSMGUI:
                     ticks_per_beat = mid.ticks_per_beat
                     tempo = 500000  # Default 120 BPM
                     
-                    for track in mid.tracks:
+                    # Process all tracks and find notes
+                    all_notes = []
+                    
+                    for track_idx, track in enumerate(mid.tracks):
+                        track_time = 0.0
+                        active_notes = {}  # Track note_on events
+                        
                         for msg in track:
-                            current_time += msg.time
+                            track_time += msg.time
+                            
                             if msg.type == 'set_tempo':
                                 tempo = msg.tempo
                             elif msg.type == 'note_on' and msg.velocity > 0:
-                                # Convert MIDI to melody format
-                                time_in_beats = current_time / ticks_per_beat
-                                melody.append({
+                                # Note starts
+                                active_notes[msg.note] = {
+                                    'start_time': track_time,
                                     'pitch': msg.note,
-                                    'duration': 0.25,  # Default quarter note
-                                    'time': time_in_beats
-                                })
+                                    'velocity': msg.velocity
+                                }
+                            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                                # Note ends
+                                if msg.note in active_notes:
+                                    note_data = active_notes[msg.note]
+                                    duration_ticks = track_time - note_data['start_time']
+                                    duration_beats = duration_ticks / ticks_per_beat
+                                    time_beats = note_data['start_time'] / ticks_per_beat
+                                    
+                                    all_notes.append({
+                                        'pitch': note_data['pitch'],
+                                        'duration': max(0.125, duration_beats),  # Minimum 1/8 note
+                                        'time': time_beats,
+                                        'velocity': note_data['velocity'],
+                                        'track': track_idx
+                                    })
+                                    
+                                    del active_notes[msg.note]
                     
-                    return melody[:16]  # Limit to first 16 notes for display
+                    # Sort by time and take the main melody (usually highest pitches or first track)
+                    all_notes.sort(key=lambda x: x['time'])
+                    
+                    # Filter to get main melody line (prefer higher pitches and stronger velocities)
+                    melody = []
+                    for note in all_notes[:32]:  # Limit to first 32 notes
+                        melody.append({
+                            'pitch': note['pitch'],
+                            'duration': note['duration'],
+                            'time': note['time']
+                        })
+                    
+                    return melody
             
             return None
             
         except Exception as e:
+            print(f"Error extracting melody from MIDI: {e}")
+            return None
             print(f"Error extracting melody from MIDI: {e}")
             return None
     
@@ -1071,16 +1246,32 @@ class EnhancedABRSMGUI:
         api_frame = ttk.LabelFrame(feedback_frame, text="AI Configuration")
         api_frame.pack(fill=tk.X, padx=10, pady=10)
         
+        # API key row
         api_controls = ttk.Frame(api_frame)
-        api_controls.pack(fill=tk.X, padx=10, pady=10)
+        api_controls.pack(fill=tk.X, padx=10, pady=5)
         
         ttk.Label(api_controls, text="Google API Key:").pack(side=tk.LEFT)
         self.api_key_var = tk.StringVar(value=os.environ.get("GOOGLE_API_KEY", ""))
-        api_entry = ttk.Entry(api_controls, textvariable=self.api_key_var, show="*", width=40)
+        api_entry = ttk.Entry(api_controls, textvariable=self.api_key_var, width=40)
         api_entry.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
         
-        ttk.Button(api_controls, text="Generate Enhanced Feedback", 
-                  command=self.generate_enhanced_feedback).pack(side=tk.RIGHT, padx=(10, 0))
+        # Performer score row
+        score_controls = ttk.Frame(api_frame)
+        score_controls.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(score_controls, text="Performer Score (0-100):").pack(side=tk.LEFT)
+        self.performer_score_var = tk.StringVar(value="")
+        score_entry = ttk.Entry(score_controls, textvariable=self.performer_score_var, width=10)
+        score_entry.pack(side=tk.LEFT, padx=(10, 0))
+        
+        ttk.Label(score_controls, text="(Optional - helps generate targeted feedback)").pack(side=tk.LEFT, padx=(10, 0))
+        
+        # Generate button row
+        button_controls = ttk.Frame(api_frame)
+        button_controls.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Button(button_controls, text="Generate Enhanced Feedback", 
+                  command=self.generate_enhanced_feedback).pack(side=tk.RIGHT)
         
         # Enhanced feedback display with sections
         feedback_notebook = ttk.Notebook(feedback_frame)
@@ -2435,8 +2626,564 @@ This analysis looks for sections where the performer may have:
         pass
     
     def generate_enhanced_feedback(self):
-        """Generate enhanced AI feedback"""
-        pass
+        """Generate enhanced AI feedback using Google Gemini API with ABRSM-style scoring"""
+        if not self.current_analysis:
+            messagebox.showwarning("Warning", "Please run an analysis first!")
+            return
+            
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror("Error", "Please enter your Google API key!")
+            return
+        
+        # Show loading state
+        self.tech_feedback_text.config(state='normal')
+        self.tech_feedback_text.delete(1.0, tk.END)
+        self.tech_feedback_text.insert(tk.END, "🎵 Generating ABRSM-style AI feedback... Please wait.")
+        self.tech_feedback_text.config(state='disabled')
+        
+        self.musical_feedback_text.config(state='normal') 
+        self.musical_feedback_text.delete(1.0, tk.END)
+        self.musical_feedback_text.insert(tk.END, "🎭 Analyzing musical interpretation...")
+        self.musical_feedback_text.config(state='disabled')
+        
+        self.practice_feedback_text.config(state='normal')
+        self.practice_feedback_text.delete(1.0, tk.END) 
+        self.practice_feedback_text.insert(tk.END, "📚 Preparing practice recommendations...")
+        self.practice_feedback_text.config(state='disabled')
+        
+        def generate_feedback_async():
+            try:
+                # Generate comprehensive analysis JSON
+                analysis_json = self._generate_comprehensive_analysis_json()
+                
+                # Create ABRSM-style prompt with detailed scoring examples
+                prompt = self._create_abrsm_scoring_prompt(analysis_json)
+                
+                # Call Google Gemini API
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
+                
+                headers = {'Content-Type': 'application/json'}
+                
+                payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.7,
+                        "topK": 40,
+                        "topP": 0.95,
+                        "maxOutputTokens": 2048
+                    }
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=45)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if 'candidates' in result and len(result['candidates']) > 0:
+                        feedback_text = result['candidates'][0]['content']['parts'][0]['text']
+                        
+                        # Parse the structured feedback
+                        parsed_feedback = self._parse_structured_abrsm_feedback(feedback_text)
+                        
+                        # Update UI in main thread
+                        self.root.after(0, self._update_abrsm_feedback_ui, parsed_feedback)
+                    else:
+                        error_msg = "No response generated from AI model"
+                        self.root.after(0, self._show_feedback_error, error_msg)
+                else:
+                    error_msg = f"API Error {response.status_code}: {response.text}"
+                    self.root.after(0, self._show_feedback_error, error_msg)
+                    
+            except Exception as e:
+                error_msg = f"Error generating feedback: {str(e)}"
+                self.root.after(0, self._show_feedback_error, error_msg)
+        
+        # Run in background thread
+        threading.Thread(target=generate_feedback_async, daemon=True).start()
+    
+    def _generate_comprehensive_analysis_json(self):
+        """Generate a comprehensive JSON analysis of the performance"""
+        analysis_data = self.current_analysis
+        piece_name = self.piece_var.get()
+        
+        # Extract detailed metrics
+        standard_analysis = analysis_data.get('standard_analysis', {})
+        note_details = standard_analysis.get('note_details', [])
+        overall_assessment = standard_analysis.get('overall_assessment', {})
+        
+        # Calculate comprehensive statistics
+        total_notes = len(note_details)
+        pitch_errors = []
+        timing_errors = []
+        missed_notes = 0
+        excellent_notes = 0
+        good_notes = 0
+        poor_notes = 0
+        
+        for note in note_details:
+            pitch_dev = note.get('pitch_deviation_cents', 0)
+            timing_dev = note.get('timing_deviation_ms', 0)
+            
+            if str(pitch_dev) == 'MISSED' or str(timing_dev) == 'MISSED':
+                missed_notes += 1
+            else:
+                if isinstance(pitch_dev, (int, float)):
+                    pitch_errors.append(abs(pitch_dev))
+                if isinstance(timing_dev, (int, float)):
+                    timing_errors.append(abs(timing_dev))
+                
+                # Categorize note quality
+                if (isinstance(pitch_dev, (int, float)) and abs(pitch_dev) < 20 and 
+                    isinstance(timing_dev, (int, float)) and abs(timing_dev) < 50):
+                    excellent_notes += 1
+                elif (isinstance(pitch_dev, (int, float)) and abs(pitch_dev) < 50 and 
+                      isinstance(timing_dev, (int, float)) and abs(timing_dev) < 100):
+                    good_notes += 1
+                else:
+                    poor_notes += 1
+        
+        # Calculate averages and percentages
+        avg_pitch_error = np.mean(pitch_errors) if pitch_errors else 0
+        avg_timing_error = np.mean(timing_errors) if timing_errors else 0
+        completion_rate = ((total_notes - missed_notes) / total_notes * 100) if total_notes > 0 else 0
+        accuracy_rate = (excellent_notes / total_notes * 100) if total_notes > 0 else 0
+        
+        # Technical difficulty assessment
+        max_pitch_error = max(pitch_errors) if pitch_errors else 0
+        max_timing_error = max(timing_errors) if timing_errors else 0
+        
+        # Create comprehensive analysis JSON
+        comprehensive_analysis = {
+            "piece_information": {
+                "title": piece_name.replace('_', ' ').title(),
+                "analysis_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_expected_notes": total_notes
+            },
+            "performance_statistics": {
+                "completion_rate_percentage": round(completion_rate, 1),
+                "accuracy_rate_percentage": round(accuracy_rate, 1),
+                "total_notes_attempted": total_notes - missed_notes,
+                "notes_played_correctly": excellent_notes,
+                "notes_with_minor_issues": good_notes,
+                "notes_with_major_issues": poor_notes,
+                "completely_missed_notes": missed_notes
+            },
+            "technical_metrics": {
+                "pitch_accuracy": {
+                    "average_deviation_cents": round(avg_pitch_error, 1),
+                    "maximum_deviation_cents": round(max_pitch_error, 1),
+                    "notes_within_25_cents": len([e for e in pitch_errors if e <= 25]),
+                    "notes_within_50_cents": len([e for e in pitch_errors if e <= 50]),
+                    "significant_pitch_errors": len([e for e in pitch_errors if e > 50])
+                },
+                "timing_accuracy": {
+                    "average_deviation_ms": round(avg_timing_error, 1),
+                    "maximum_deviation_ms": round(max_timing_error, 1),
+                    "notes_within_50ms": len([e for e in timing_errors if e <= 50]),
+                    "notes_within_100ms": len([e for e in timing_errors if e <= 100]),
+                    "significant_timing_errors": len([e for e in timing_errors if e > 100])
+                }
+            },
+            "detailed_note_analysis": [
+                {
+                    "note_number": i + 1,
+                    "expected_pitch": note.get('expected_pitch', 'Unknown'),
+                    "detected_pitch": note.get('actual_pitch', 'Not detected'),
+                    "pitch_deviation_cents": note.get('pitch_deviation_cents', 'N/A'),
+                    "timing_deviation_ms": note.get('timing_deviation_ms', 'N/A'),
+                    "expected_time": note.get('expected_time', 0),
+                    "actual_time": note.get('actual_time', 0),
+                    "accuracy_category": self._categorize_note_accuracy(note)
+                }
+                for i, note in enumerate(note_details[:10])  # Include first 10 notes for detailed analysis
+            ],
+            "overall_assessment": {
+                "estimated_abrsm_score": self._estimate_abrsm_score(completion_rate, accuracy_rate, avg_pitch_error, avg_timing_error),
+                "performance_level": self._assess_performance_level(completion_rate, accuracy_rate),
+                "key_strengths": self._identify_strengths(note_details),
+                "main_challenges": self._identify_challenges(note_details)
+            }
+        }
+        
+        return comprehensive_analysis
+    
+    def _categorize_note_accuracy(self, note):
+        """Categorize individual note accuracy"""
+        pitch_dev = note.get('pitch_deviation_cents', 0)
+        timing_dev = note.get('timing_deviation_ms', 0)
+        
+        if str(pitch_dev) == 'MISSED' or str(timing_dev) == 'MISSED':
+            return "missed"
+        elif (isinstance(pitch_dev, (int, float)) and abs(pitch_dev) < 20 and 
+              isinstance(timing_dev, (int, float)) and abs(timing_dev) < 50):
+            return "excellent"
+        elif (isinstance(pitch_dev, (int, float)) and abs(pitch_dev) < 50 and 
+              isinstance(timing_dev, (int, float)) and abs(timing_dev) < 100):
+            return "good"
+        else:
+            return "needs_improvement"
+    
+    def _estimate_abrsm_score(self, completion_rate, accuracy_rate, avg_pitch_error, avg_timing_error):
+        """Estimate ABRSM-style score based on performance metrics"""
+        base_score = 60  # Starting point
+        
+        # Completion bonus (up to 20 points)
+        completion_bonus = min(20, completion_rate * 0.2)
+        
+        # Accuracy bonus (up to 15 points)
+        accuracy_bonus = min(15, accuracy_rate * 0.15)
+        
+        # Pitch accuracy (up to 10 points)
+        if avg_pitch_error < 20:
+            pitch_bonus = 10
+        elif avg_pitch_error < 50:
+            pitch_bonus = 7
+        elif avg_pitch_error < 100:
+            pitch_bonus = 4
+        else:
+            pitch_bonus = 1
+        
+        # Timing accuracy (up to 10 points)
+        if avg_timing_error < 50:
+            timing_bonus = 10
+        elif avg_timing_error < 100:
+            timing_bonus = 7
+        elif avg_timing_error < 200:
+            timing_bonus = 4
+        else:
+            timing_bonus = 1
+        
+        total_score = base_score + completion_bonus + accuracy_bonus + pitch_bonus + timing_bonus
+        return min(100, max(45, int(total_score)))  # Cap between 45-100
+    
+    def _assess_performance_level(self, completion_rate, accuracy_rate):
+        """Assess overall performance level"""
+        if completion_rate > 90 and accuracy_rate > 80:
+            return "Advanced"
+        elif completion_rate > 75 and accuracy_rate > 60:
+            return "Intermediate"
+        elif completion_rate > 50:
+            return "Elementary"
+        else:
+            return "Beginner"
+    
+    def _identify_strengths(self, note_details):
+        """Identify performance strengths"""
+        strengths = []
+        
+        # Analyze patterns in the data
+        timing_errors = [abs(n.get('timing_deviation_ms', 0)) for n in note_details 
+                        if isinstance(n.get('timing_deviation_ms'), (int, float))]
+        pitch_errors = [abs(n.get('pitch_deviation_cents', 0)) for n in note_details 
+                       if isinstance(n.get('pitch_deviation_cents'), (int, float))]
+        
+        if timing_errors and np.mean(timing_errors) < 75:
+            strengths.append("Good rhythmic stability")
+        if pitch_errors and np.mean(pitch_errors) < 40:
+            strengths.append("Accurate pitch control")
+        if len(note_details) > 0 and len([n for n in note_details if str(n.get('timing_deviation_ms')) != 'MISSED']) > len(note_details) * 0.85:
+            strengths.append("Good note completion rate")
+        
+        return strengths if strengths else ["Attempted the performance"]
+    
+    def _identify_challenges(self, note_details):
+        """Identify performance challenges"""
+        challenges = []
+        
+        timing_errors = [abs(n.get('timing_deviation_ms', 0)) for n in note_details 
+                        if isinstance(n.get('timing_deviation_ms'), (int, float))]
+        pitch_errors = [abs(n.get('pitch_deviation_cents', 0)) for n in note_details 
+                       if isinstance(n.get('pitch_deviation_cents'), (int, float))]
+        
+        if timing_errors and np.mean(timing_errors) > 100:
+            challenges.append("Rhythmic timing consistency")
+        if pitch_errors and np.mean(pitch_errors) > 60:
+            challenges.append("Pitch accuracy and intonation")
+        if len([n for n in note_details if str(n.get('timing_deviation_ms')) == 'MISSED']) > len(note_details) * 0.1:
+            challenges.append("Note completion and continuity")
+        
+        return challenges if challenges else ["Overall performance consistency"]
+    
+    def _create_abrsm_scoring_prompt(self, analysis_json):
+        """Create comprehensive ABRSM-style scoring prompt"""
+        
+        # Get performer score if provided
+        performer_score = self.performer_score_var.get().strip()
+        performer_context = ""
+        if performer_score:
+            try:
+                score_value = float(performer_score)
+                if 0 <= score_value <= 100:
+                    performer_context = f"""
+PERFORMER'S SELF-ASSESSMENT SCORE: {score_value}/100
+
+The performer has indicated they believe their performance merits {score_value} points. Consider this in your evaluation:
+- If significantly higher than your assessment: discuss realistic self-evaluation and areas for improvement
+- If significantly lower than your assessment: provide encouragement and highlight strengths they may not recognize
+- If close to your assessment: acknowledge their good self-awareness
+
+"""
+            except ValueError:
+                pass  # Ignore invalid score input
+                
+        return f"""
+You are an expert ABRSM (Associated Board of the Royal Schools of Music) examiner with 20+ years of experience evaluating musical performances. You must think and score exactly like an official ABRSM examiner, considering all aspects of musical performance according to ABRSM standards.
+
+{performer_context}ABRSM SCORING FRAMEWORK (0-100 points):
+You must assign a score within one of these ranges based on the performance quality:
+
+📊 SCORING BANDS WITH DETAILED CRITERIA:
+
+🔴 FAIL (45-59 points):
+- Score 45-49: Significant technical problems, many missed notes, poor rhythm, limited musical understanding
+- Score 50-54: Basic attempt but major technical difficulties, inconsistent tempo, pitch problems
+- Score 55-59: Some musical elements present but needs substantial improvement in accuracy and fluency
+
+🟡 PASS (60-69 points):
+- Score 60-64: Adequate performance with some technical control, mostly accurate notes, basic musical shape
+- Score 65-69: Generally secure performance, good note accuracy, clear musical structure, minor technical issues
+
+🟢 MERIT (70-79 points):
+- Score 70-74: Good technical control, accurate pitching and rhythm, musical understanding evident
+- Score 75-79: Confident performance, well-controlled technique, good musical communication
+
+🔵 DISTINCTION (80-89 points):
+- Score 80-84: Excellent technical skills, musical maturity, engaging performance, minor imperfections
+- Score 85-89: Very high standard, excellent musical communication, confident and expressive
+
+🟣 EXCEPTIONAL (90-100 points):
+- Score 90-94: Outstanding performance, excellent technique and musicality, professional standard
+- Score 95-100: Exceptional artistry, perfect or near-perfect execution, inspirational performance
+
+DETAILED PERFORMANCE ANALYSIS DATA:
+```json
+{json.dumps(analysis_json, indent=2)}
+```
+
+ANALYSIS METRICS EXPLANATION:
+- pitch_deviation_cents: Difference from expected pitch (±25 cents = excellent, ±50 cents = good, >50 cents = needs work)
+- timing_deviation_ms: Difference from expected timing (±50ms = excellent, ±100ms = good, >100ms = needs work)
+- completion_rate_percentage: Percentage of notes successfully attempted
+- accuracy_rate_percentage: Percentage of notes played with high accuracy
+- note categories: excellent = both pitch and timing within tolerances, good = minor deviations, needs_improvement = significant issues
+
+REQUIRED RESPONSE FORMAT:
+You must respond with exactly this JSON structure (no additional text before or after):
+
+```json
+{{
+  "abrsm_score": [score from 45-100],
+  "score_band": "[FAIL/PASS/MERIT/DISTINCTION/EXCEPTIONAL]",
+  "technical_analysis": {{
+    "score_breakdown": "[Detailed explanation of how you arrived at the score]",
+    "pitch_accuracy_assessment": "[Assessment of intonation and pitch control]",
+    "rhythmic_accuracy_assessment": "[Assessment of timing and rhythmic precision]",
+    "fluency_and_continuity": "[Assessment of flow and note completion]",
+    "overall_technical_grade": "[A/B/C/D/E grade for technical execution]"
+  }},
+  "musical_interpretation": {{
+    "phrasing_and_expression": "[Assessment of musical shaping and expression]",
+    "style_and_character": "[Assessment of appropriate musical style]",
+    "dynamic_control": "[Assessment of volume and intensity variation]",
+    "musical_communication": "[Assessment of how well music was communicated]",
+    "overall_musical_grade": "[A/B/C/D/E grade for musical interpretation]"
+  }},
+  "practice_recommendations": {{
+    "immediate_priorities": ["[List 2-3 most urgent areas to work on]"],
+    "technical_exercises": ["[Specific exercises to address technical issues]"],
+    "musical_development": ["[Suggestions for improving musical understanding]"],
+    "long_term_goals": ["[Goals for continued development]"]
+  }},
+  "examiner_comments": {{
+    "positive_aspects": ["[What the student did well]"],
+    "areas_for_improvement": ["[Specific areas needing attention]"],
+    "next_steps": "[Concrete advice for moving forward]",
+    "encouragement": "[Motivational message appropriate to the level]"
+  }}
+}}
+```
+
+Remember: 
+- Be precise and fair in your scoring according to ABRSM standards
+- Consider this is likely a student performance, not a professional recording
+- Balance constructive criticism with encouragement
+- Focus on specific, actionable feedback
+- Score should reflect the overall standard while acknowledging the learning process
+"""
+
+    def _parse_structured_abrsm_feedback(self, feedback_text):
+        """Parse the structured ABRSM feedback from AI response"""
+        try:
+            # Look for JSON structure in the response
+            import re
+            
+            # Extract JSON from markdown code blocks or direct JSON
+            json_match = re.search(r'```json\s*(.*?)\s*```', feedback_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try to find JSON directly
+                json_start = feedback_text.find('{')
+                json_end = feedback_text.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = feedback_text[json_start:json_end]
+                else:
+                    raise ValueError("No JSON structure found in response")
+            
+            # Parse the JSON
+            parsed_feedback = json.loads(json_str)
+            
+            # Validate required fields
+            required_fields = ['abrsm_score', 'score_band', 'technical_analysis', 'musical_interpretation', 'practice_recommendations', 'examiner_comments']
+            for field in required_fields:
+                if field not in parsed_feedback:
+                    parsed_feedback[field] = {"error": f"Missing {field} in AI response"}
+            
+            return parsed_feedback
+            
+        except Exception as e:
+            print(f"Error parsing ABRSM feedback: {e}")
+            # Return fallback structure
+            return {
+                "abrsm_score": 65,
+                "score_band": "PASS",
+                "technical_analysis": {"error": f"Parsing error: {str(e)}"},
+                "musical_interpretation": {"error": "Could not parse musical analysis"},
+                "practice_recommendations": {"error": "Could not parse recommendations"},
+                "examiner_comments": {"error": "Could not parse examiner comments"},
+                "raw_response": feedback_text
+            }
+    
+    def _update_abrsm_feedback_ui(self, parsed_feedback):
+        """Update feedback UI with parsed ABRSM-style feedback"""
+        try:
+            # Technical Analysis Tab
+            technical_content = f"""🎯 ABRSM SCORE: {parsed_feedback.get('abrsm_score', 'N/A')}/100 ({parsed_feedback.get('score_band', 'N/A')})
+
+📊 TECHNICAL ANALYSIS:
+
+Score Breakdown:
+{parsed_feedback.get('technical_analysis', {}).get('score_breakdown', 'Not available')}
+
+Pitch Accuracy Assessment:
+{parsed_feedback.get('technical_analysis', {}).get('pitch_accuracy_assessment', 'Not available')}
+
+Rhythmic Accuracy Assessment:
+{parsed_feedback.get('technical_analysis', {}).get('rhythmic_accuracy_assessment', 'Not available')}
+
+Fluency and Continuity:
+{parsed_feedback.get('technical_analysis', {}).get('fluency_and_continuity', 'Not available')}
+
+Overall Technical Grade: {parsed_feedback.get('technical_analysis', {}).get('overall_technical_grade', 'N/A')}
+"""
+            
+            # Musical Interpretation Tab
+            musical_content = f"""🎭 MUSICAL INTERPRETATION:
+
+Phrasing and Expression:
+{parsed_feedback.get('musical_interpretation', {}).get('phrasing_and_expression', 'Not available')}
+
+Style and Character:
+{parsed_feedback.get('musical_interpretation', {}).get('style_and_character', 'Not available')}
+
+Dynamic Control:
+{parsed_feedback.get('musical_interpretation', {}).get('dynamic_control', 'Not available')}
+
+Musical Communication:
+{parsed_feedback.get('musical_interpretation', {}).get('musical_communication', 'Not available')}
+
+Overall Musical Grade: {parsed_feedback.get('musical_interpretation', {}).get('overall_musical_grade', 'N/A')}
+"""
+            
+            # Practice Recommendations Tab
+            practice_content = f"""📚 PRACTICE RECOMMENDATIONS:
+
+🔴 IMMEDIATE PRIORITIES:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('practice_recommendations', {}).get('immediate_priorities', ['Not available']))}
+
+🔧 TECHNICAL EXERCISES:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('practice_recommendations', {}).get('technical_exercises', ['Not available']))}
+
+🎵 MUSICAL DEVELOPMENT:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('practice_recommendations', {}).get('musical_development', ['Not available']))}
+
+🎯 LONG-TERM GOALS:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('practice_recommendations', {}).get('long_term_goals', ['Not available']))}
+
+💬 EXAMINER COMMENTS:
+
+✅ Positive Aspects:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('examiner_comments', {}).get('positive_aspects', ['Not available']))}
+
+⚠️ Areas for Improvement:
+{chr(10).join(f"• {item}" for item in parsed_feedback.get('examiner_comments', {}).get('areas_for_improvement', ['Not available']))}
+
+➡️ Next Steps:
+{parsed_feedback.get('examiner_comments', {}).get('next_steps', 'Not available')}
+
+💪 Encouragement:
+{parsed_feedback.get('examiner_comments', {}).get('encouragement', 'Keep practicing!')}
+"""
+            
+            # Update the text widgets
+            self.tech_feedback_text.config(state='normal')
+            self.tech_feedback_text.delete(1.0, tk.END)
+            self.tech_feedback_text.insert(tk.END, technical_content)
+            self.tech_feedback_text.config(state='disabled')
+            
+            self.musical_feedback_text.config(state='normal')
+            self.musical_feedback_text.delete(1.0, tk.END)
+            self.musical_feedback_text.insert(tk.END, musical_content)
+            self.musical_feedback_text.config(state='disabled')
+            
+            self.practice_feedback_text.config(state='normal')
+            self.practice_feedback_text.delete(1.0, tk.END)
+            self.practice_feedback_text.insert(tk.END, practice_content)
+            self.practice_feedback_text.config(state='disabled')
+            
+        except Exception as e:
+            error_msg = f"Error displaying feedback: {str(e)}"
+            self._show_feedback_error(error_msg)
+    
+    def _show_feedback_error(self, error_msg):
+        """Show error message in feedback tabs"""
+        error_content = f"""❌ ERROR GENERATING FEEDBACK
+
+{error_msg}
+
+Please check:
+• Your Google API key is valid
+• You have internet connection  
+• You have run an analysis first
+• The analysis contains valid data
+
+Try running the analysis again and then generating feedback."""
+
+        # Update all feedback tabs with error message
+        if hasattr(self, 'tech_feedback_text'):
+            self.tech_feedback_text.config(state='normal')
+            self.tech_feedback_text.delete(1.0, tk.END)
+            self.tech_feedback_text.insert(tk.END, error_content)
+            self.tech_feedback_text.config(state='disabled')
+        
+        if hasattr(self, 'musical_feedback_text'):
+            self.musical_feedback_text.config(state='normal')
+            self.musical_feedback_text.delete(1.0, tk.END)
+            self.musical_feedback_text.insert(tk.END, error_content)
+            self.musical_feedback_text.config(state='disabled')
+        
+        if hasattr(self, 'practice_feedback_text'):
+            self.practice_feedback_text.config(state='normal')
+            self.practice_feedback_text.delete(1.0, tk.END)
+            self.practice_feedback_text.insert(tk.END, error_content)
+            self.practice_feedback_text.config(state='disabled')
+        
+        print(f"❌ Feedback Error: {error_msg}")
     
     def export_detailed_report(self):
         """Export detailed analysis report"""
