@@ -1,275 +1,289 @@
 #!/usr/bin/env python3
 """
-Sheet Music Visualization and Diff Display Module
-
-This module adds visual sheet music representation and difference highlighting
-to the ABRSM AI Music Feedback System.
+Enhanced Sheet Music Visualizer using music21
+Properly generates sheet music with performance differences marked
 """
 
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from matplotlib.patches import Rectangle
-import librosa
+import matplotlib.patches as mpatches
 
-class SheetMusicVisualizer:
+try:
+    from music21 import stream, note, pitch, duration, meter, tempo, key, bar, clef, metadata
+    from music21.midi import translate
+    MUSIC21_AVAILABLE = True
+except ImportError:
+    MUSIC21_AVAILABLE = False
+    print("music21 not available - using fallback visualization")
+
+class Music21SheetVisualizer:
     def __init__(self):
-        # Staff line positions (treble clef)
-        self.staff_lines = [0, 0.5, 1, 1.5, 2]  # E, G, B, D, F
-        self.line_to_note = {
-            # Lines
-            0: 'E4',    # Bottom line
-            0.5: 'F4',  # Below first space
-            1: 'G4',    # Second line
-            1.5: 'A4',  # Second space
-            2: 'B4',    # Third line
-            2.5: 'C5',  # Third space
-            3: 'D5',    # Fourth line
-            3.5: 'E5',  # Fourth space
-            4: 'F5',    # Top line
-        }
+        self.staff_height = 4
+        self.line_spacing = 0.5
         
-        # Reverse mapping
-        self.note_to_line = {v: k for k, v in self.line_to_note.items()}
+    def create_sheet_music_from_melody(self, melody_data, performance_data=None, output_path="visualizations/sheet_music_analysis.png"):
+        """Create sheet music using music21 with performance differences highlighted"""
+        if not MUSIC21_AVAILABLE:
+            return self._create_fallback_visualization(melody_data, performance_data, output_path)
         
-        # Add more notes for extended range
-        extended_notes = {
-            'C4': -0.5, 'D4': 0.25, 'E4': 0, 'F4': 0.5, 'G4': 1, 'A4': 1.5, 
-            'B4': 2, 'C5': 2.5, 'D5': 3, 'E5': 3.5, 'F5': 4, 'G5': 4.5
-        }
-        self.note_to_line.update(extended_notes)
-
-    def midi_to_staff_position(self, midi_note):
-        """Convert MIDI note number to staff line position"""
-        note_name = librosa.midi_to_note(midi_note)
-        return self.note_to_line.get(note_name, 1)  # Default to G4 if not found
-
-    def create_sheet_music_visualization(self, reference_melody, performance_data, 
-                                       output_path="visualizations/sheet_music_diff.png", 
-                                       time_signature=(4, 4)):
-        """
-        Create a sheet music visualization showing reference vs performance with diffs
-        
-        Args:
-            reference_melody: List of reference notes with pitch and duration
-            performance_data: Analysis data from performance
-            output_path: Where to save the visualization
-            time_signature: Tuple of (beats_per_measure, note_value)
-        """
-        
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12))
-        fig.suptitle('Sheet Music Analysis: Reference vs Performance', fontsize=16, fontweight='bold')
-        
-        # Draw reference sheet music
-        self._draw_staff_and_notes(ax1, reference_melody, "Reference (Expected)", 
-                                 time_signature, is_reference=True)
-        
-        # Draw performance sheet music
-        self._draw_staff_and_notes(ax2, performance_data.get('note_details', []), 
-                                 "Performance (Detected)", time_signature, is_reference=False)
-        
-        # Draw difference visualization
-        self._draw_difference_analysis(ax3, reference_melody, performance_data.get('note_details', []),
-                                     time_signature)
-        
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✓ Sheet music visualization saved to: {output_path}")
-        return output_path
-
-    def _draw_staff_and_notes(self, ax, notes_data, title, time_signature, is_reference=True):
-        """Draw staff lines and notes"""
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
-        
-        # Draw staff lines
-        staff_width = 12
-        for line_pos in self.staff_lines:
-            ax.plot([0, staff_width], [line_pos, line_pos], 'k-', linewidth=1)
-        
-        # Draw time signature
-        ax.text(-0.8, 1.8, str(time_signature[0]), fontsize=20, ha='center', va='center', fontweight='bold')
-        ax.text(-0.8, 0.8, str(time_signature[1]), fontsize=20, ha='center', va='center', fontweight='bold')
-        
-        # Draw treble clef (simplified)
-        ax.text(-0.5, 1, '𝄞', fontsize=30, ha='center', va='center')
-        
-        # Calculate measures and beat positions
-        beats_per_measure = time_signature[0]
-        current_beat = 0
-        current_measure = 0
-        x_position = 0.5
-        
-        # Draw measure lines
-        for measure in range(int(staff_width / 3) + 1):
-            measure_x = measure * 3
-            if measure_x <= staff_width:
-                ax.plot([measure_x, measure_x], [-0.5, 4.5], 'k-', linewidth=2)
-        
-        # Draw notes
-        for i, note_data in enumerate(notes_data):
-            if is_reference:
-                # Reference data format
-                midi_note = note_data['pitch']
-                duration = note_data['duration']
-                note_name = librosa.midi_to_note(midi_note)
+        try:
+            # Create a new music21 stream
+            score = stream.Stream()
+            
+            # Add metadata
+            score.append(metadata.Metadata())
+            score.metadata.title = 'Performance Analysis'
+            score.metadata.composer = 'ABRSM AI Analysis'
+            
+            # Add time signature (4/4 default)
+            score.append(meter.TimeSignature('4/4'))
+            
+            # Add key signature (C major default)
+            score.append(key.KeySignature(0))
+            
+            # Add tempo
+            score.append(tempo.TempoIndication(number=120))
+            
+            # Add treble clef
+            score.append(clef.TrebleClef())
+            
+            # Convert melody to music21 notes
+            for i, note_data in enumerate(melody_data):
+                # Create note
+                n = note.Note()
+                n.pitch.midi = note_data['pitch']
+                
+                # Set duration (convert from our format to music21 format)
+                dur_quarters = note_data.get('duration', 0.25) * 4  # Convert to quarter notes
+                n.duration = duration.Duration(quarterLength=dur_quarters)
+                
+                # Color coding based on performance
+                if performance_data and 'note_details' in performance_data:
+                    note_details = performance_data['note_details']
+                    if i < len(note_details):
+                        detail = note_details[i]
+                        if detail.get('timing_deviation_ms') == 'MISSED':
+                            n.style.color = 'red'
+                        elif abs(detail.get('timing_deviation_ms', 0)) > 100:
+                            n.style.color = 'orange'
+                        elif abs(detail.get('pitch_deviation_cents', 0)) > 50:
+                            n.style.color = 'blue'
+                        else:
+                            n.style.color = 'green'
+                
+                score.append(n)
+            
+            # Generate the sheet music image
+            if hasattr(score, 'write'):
+                # Try to write as PNG (requires additional dependencies)
+                try:
+                    score.write('musicxml.png', fp=output_path)
+                    print(f"✓ Sheet music created with music21: {output_path}")
+                    return output_path
+                except:
+                    # Fallback to MIDI then convert
+                    midi_path = output_path.replace('.png', '.mid')
+                    score.write('midi', fp=midi_path)
+                    print(f"✓ MIDI created, converting to sheet music visualization...")
+                    return self._create_visualization_from_midi(midi_path, performance_data, output_path)
             else:
-                # Performance data format
-                if 'detected_pitch' in note_data and note_data['detected_pitch'] != 'MISSED':
-                    note_name = note_data['detected_pitch']
-                    midi_note = librosa.note_to_midi(note_name)
-                    duration = 0.25  # Default duration for detected notes
-                else:
-                    # Skip missed notes
-                    continue
+                return self._create_fallback_visualization(melody_data, performance_data, output_path)
+                
+        except Exception as e:
+            print(f"Error with music21 sheet generation: {e}")
+            return self._create_fallback_visualization(melody_data, performance_data, output_path)
+    
+    def _create_visualization_from_midi(self, midi_path, performance_data, output_path):
+        """Create visualization from MIDI file"""
+        try:
+            # Load MIDI with music21
+            score = translate.midiFilePathToStream(midi_path)
             
-            # Calculate staff position
-            staff_pos = self.midi_to_staff_position(midi_note)
+            # Create matplotlib visualization
+            fig, ax = plt.subplots(figsize=(14, 8))
             
-            # Draw note head
-            note_color = 'black' if is_reference else 'blue'
-            circle = plt.Circle((x_position, staff_pos), 0.08, color=note_color, zorder=10)
-            ax.add_patch(circle)
+            # Draw staff lines
+            staff_y = 2
+            for i in range(5):
+                ax.axhline(y=staff_y + i * 0.5, color='black', linewidth=1)
             
-            # Add note name below staff
-            ax.text(x_position, -0.8, note_name, ha='center', va='center', 
-                   fontsize=10, color=note_color)
+            # Draw notes
+            x_pos = 1
+            note_width = 0.8
             
-            # Draw stem (simplified)
-            if staff_pos < 2:  # Stem up
-                ax.plot([x_position + 0.08, x_position + 0.08], 
-                       [staff_pos, staff_pos + 1.5], color=note_color, linewidth=2)
-            else:  # Stem down
-                ax.plot([x_position - 0.08, x_position - 0.08], 
-                       [staff_pos, staff_pos - 1.5], color=note_color, linewidth=2)
+            notes = score.flat.notes
+            for i, n in enumerate(notes):
+                if hasattr(n, 'pitch'):
+                    # Calculate y position based on pitch
+                    midi_num = n.pitch.midi
+                    # C4 (middle C) = 60, corresponds to staff_y + 1 (below staff)
+                    y_pos = staff_y + (midi_num - 60) * 0.25
+                    
+                    # Color based on performance data
+                    color = 'black'
+                    if performance_data and 'note_details' in performance_data:
+                        note_details = performance_data['note_details']
+                        if i < len(note_details):
+                            detail = note_details[i]
+                            if detail.get('timing_deviation_ms') == 'MISSED':
+                                color = 'red'
+                            elif abs(detail.get('timing_deviation_ms', 0)) > 100:
+                                color = 'orange'
+                            elif abs(detail.get('pitch_deviation_cents', 0)) > 50:
+                                color = 'blue'
+                            else:
+                                color = 'green'
+                    
+                    # Draw note
+                    circle = plt.Circle((x_pos, y_pos), 0.15, color=color, fill=True)
+                    ax.add_patch(circle)
+                    
+                    # Add note name
+                    ax.text(x_pos, y_pos - 0.8, n.pitch.name, ha='center', va='top', fontsize=8)
+                    
+                    x_pos += note_width
             
-            # Move to next position
-            x_position += 0.8
-            if x_position > staff_width:
-                break
+            # Set up the plot
+            ax.set_xlim(0, x_pos + 1)
+            ax.set_ylim(staff_y - 1, staff_y + 5)
+            ax.set_aspect('equal')
+            ax.axis('off')
+            
+            # Add title
+            title = "Sheet Music Analysis"
+            if performance_data and 'metadata' in performance_data:
+                title = f"Sheet Music Analysis: {performance_data['metadata'].get('piece', 'Unknown')}"
+            ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+            
+            # Add legend
+            legend_elements = [
+                mpatches.Patch(color='green', label='Correct'),
+                mpatches.Patch(color='blue', label='Pitch Error'),
+                mpatches.Patch(color='orange', label='Timing Error'),
+                mpatches.Patch(color='red', label='Missed Note')
+            ]
+            ax.legend(handles=legend_elements, loc='upper right')
+            
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            print(f"✓ Sheet music visualization created: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            print(f"Error creating visualization from MIDI: {e}")
+            return self._create_fallback_visualization([], performance_data, output_path)
+    
+    def _create_fallback_visualization(self, melody_data, performance_data, output_path):
+        """Fallback visualization without music21"""
+        fig, ax = plt.subplots(figsize=(14, 8))
         
-        # Set axis properties
-        ax.set_xlim(-1, staff_width + 0.5)
-        ax.set_ylim(-1.5, 5)
+        # Draw staff
+        staff_y = 2
+        for i in range(5):
+            ax.axhline(y=staff_y + i * 0.5, color='black', linewidth=1)
+        
+        # Draw clef symbol (approximation)
+        ax.text(0.2, staff_y + 1, '𝄞', fontsize=40, va='center')
+        
+        # Draw notes if melody data available
+        if melody_data:
+            x_pos = 1
+            note_width = 0.6
+            
+            for i, note_data in enumerate(melody_data):
+                # Calculate y position based on MIDI pitch
+                midi_pitch = note_data['pitch']
+                # Map MIDI to staff position (C4=60 at staff_y+1)
+                y_pos = staff_y + (midi_pitch - 60) * 0.25
+                
+                # Color based on performance
+                color = 'black'
+                if performance_data and 'note_details' in performance_data:
+                    note_details = performance_data['note_details']
+                    if i < len(note_details):
+                        detail = note_details[i]
+                        if detail.get('timing_deviation_ms') == 'MISSED':
+                            color = 'red'
+                        elif isinstance(detail.get('timing_deviation_ms'), (int, float)) and abs(detail.get('timing_deviation_ms', 0)) > 100:
+                            color = 'orange'
+                        elif isinstance(detail.get('pitch_deviation_cents'), (int, float)) and abs(detail.get('pitch_deviation_cents', 0)) > 50:
+                            color = 'blue'
+                        else:
+                            color = 'green'
+                
+                # Draw note head
+                circle = plt.Circle((x_pos, y_pos), 0.12, color=color, fill=True)
+                ax.add_patch(circle)
+                
+                # Draw stem
+                stem_height = 1.5 if y_pos < staff_y + 2 else -1.5
+                ax.plot([x_pos + 0.12, x_pos + 0.12], [y_pos, y_pos + stem_height], color=color, linewidth=2)
+                
+                # Add ledger lines if needed
+                if y_pos < staff_y:
+                    for ledger_y in np.arange(staff_y - 0.5, y_pos - 0.25, -0.5):
+                        ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
+                elif y_pos > staff_y + 2:
+                    for ledger_y in np.arange(staff_y + 2.5, y_pos + 0.25, 0.5):
+                        ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
+                
+                x_pos += note_width
+        
+        # Setup plot
+        ax.set_xlim(0, max(10, x_pos + 1))
+        ax.set_ylim(staff_y - 2, staff_y + 5)
         ax.set_aspect('equal')
         ax.axis('off')
+        
+        # Add title
+        title = "Sheet Music Analysis (Fallback Mode)"
+        if performance_data and 'metadata' in performance_data:
+            title = f"Sheet Music Analysis: {performance_data['metadata'].get('piece', 'Unknown')}"
+        ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+        
+        # Add legend
+        legend_elements = [
+            mpatches.Patch(color='green', label='Correct'),
+            mpatches.Patch(color='blue', label='Pitch Error'), 
+            mpatches.Patch(color='orange', label='Timing Error'),
+            mpatches.Patch(color='red', label='Missed Note')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Fallback sheet music created: {output_path}")
+        return output_path
 
-    def _draw_difference_analysis(self, ax, reference_melody, performance_notes, time_signature):
-        """Draw a visual representation of timing and pitch differences"""
-        ax.set_title("Difference Analysis", fontsize=14, fontweight='bold', pad=20)
-        
-        # Create a timeline visualization
-        max_notes = max(len(reference_melody), len(performance_notes))
-        
-        # Draw timeline
-        timeline_y = 2
-        ax.plot([0, max_notes + 1], [timeline_y, timeline_y], 'k-', linewidth=2)
-        
-        # Analyze differences
-        for i in range(min(len(reference_melody), len(performance_notes))):
-            ref_note = reference_melody[i]
-            perf_note = performance_notes[i] if i < len(performance_notes) else None
-            
-            x_pos = i + 0.5
-            
-            if perf_note and 'timing_deviation_ms' in perf_note and perf_note['timing_deviation_ms'] != 'MISSED':
-                # Timing difference
-                timing_dev = perf_note['timing_deviation_ms']
-                if isinstance(timing_dev, (int, float)):
-                    timing_color = 'red' if abs(timing_dev) > 100 else 'orange' if abs(timing_dev) > 50 else 'green'
-                    timing_height = min(abs(timing_dev) / 200, 1)  # Normalize to 0-1
-                    
-                    # Draw timing bar
-                    rect = Rectangle((x_pos - 0.1, timeline_y + 0.1), 0.2, timing_height, 
-                                   facecolor=timing_color, alpha=0.7, label='Timing' if i == 0 else "")
-                    ax.add_patch(rect)
-                
-                # Pitch difference
-                pitch_dev = perf_note.get('pitch_deviation_cents', 0)
-                if isinstance(pitch_dev, (int, float)):
-                    pitch_color = 'red' if abs(pitch_dev) > 50 else 'orange' if abs(pitch_dev) > 20 else 'green'
-                    pitch_height = min(abs(pitch_dev) / 100, 1)  # Normalize to 0-1
-                    
-                    # Draw pitch bar
-                    rect = Rectangle((x_pos + 0.1, timeline_y + 0.1), 0.2, pitch_height, 
-                                   facecolor=pitch_color, alpha=0.7, label='Pitch' if i == 0 else "")
-                    ax.add_patch(rect)
-            else:
-                # Missed note
-                rect = Rectangle((x_pos - 0.15, timeline_y + 0.1), 0.3, 0.5, 
-                               facecolor='darkred', alpha=0.8, label='Missed' if i == 0 else "")
-                ax.add_patch(rect)
-            
-            # Add note number
-            ax.text(x_pos, timeline_y - 0.3, str(i + 1), ha='center', va='center', fontsize=10)
-        
-        # Add legend with colored circles
-        ax.text(0, 3.5, "Timing/Pitch Accuracy:", fontsize=12, fontweight='bold')
-        
-        # Good accuracy - green circle
-        circle1 = plt.Circle((0.2, 3.2), 0.05, color='green', clip_on=False)
-        ax.add_patch(circle1)
-        ax.text(0.4, 3.2, "Good (±50ms/±20¢)", fontsize=10, va='center')
-        
-        # Fair accuracy - orange circle
-        circle2 = plt.Circle((0.2, 2.9), 0.05, color='orange', clip_on=False)
-        ax.add_patch(circle2)
-        ax.text(0.4, 2.9, "Fair (±100ms/±50¢)", fontsize=10, va='center')
-        
-        # Poor accuracy - red circle
-        circle3 = plt.Circle((0.2, 2.6), 0.05, color='red', clip_on=False)
-        ax.add_patch(circle3)
-        ax.text(0.4, 2.6, "Needs Work (>100ms/>50¢)", fontsize=10, va='center')
-        
-        ax.set_xlim(-0.5, max_notes + 0.5)
-        ax.set_ylim(0, 4)
-        ax.axis('off')
-
-# Integration function for the main script
-def create_visual_analysis(reference_melody, performance_report, time_signature=(4, 4)):
-    """
-    Create visual sheet music analysis
-    
-    Args:
-        reference_melody: List of reference notes
-        performance_report: JSON analysis report
-        time_signature: Tuple of (beats_per_measure, note_value)
-    
-    Returns:
-        Path to generated visualization
-    """
-    import json
-    
-    visualizer = SheetMusicVisualizer()
-    
-    # Parse performance report if it's a string
-    if isinstance(performance_report, str):
-        performance_data = json.loads(performance_report)
-    else:
-        performance_data = performance_report
-    
-    output_path = "visualizations/sheet_music_analysis.png"
-    return visualizer.create_sheet_music_visualization(
-        reference_melody, performance_data, output_path, time_signature
-    )
+# Main function for compatibility
+def create_visual_analysis(reference_melody, performance_data, time_signature=(4, 4), output_path="visualizations/sheet_music_analysis.png"):
+    """Create sheet music visualization with performance analysis"""
+    visualizer = Music21SheetVisualizer()
+    return visualizer.create_sheet_music_from_melody(reference_melody, performance_data, output_path)
 
 if __name__ == "__main__":
-    # Test the visualization
+    # Test with sample data
     test_melody = [
-        {'pitch': 60, 'duration': 0.25}, {'pitch': 60, 'duration': 0.25},
-        {'pitch': 67, 'duration': 0.25}, {'pitch': 67, 'duration': 0.25},
+        {'pitch': 60, 'duration': 0.25},  # C4
+        {'pitch': 62, 'duration': 0.25},  # D4  
+        {'pitch': 64, 'duration': 0.25},  # E4
+        {'pitch': 65, 'duration': 0.25},  # F4
     ]
     
     test_performance = {
+        'metadata': {'piece': 'Test Piece'},
         'note_details': [
-            {'detected_pitch': 'C4', 'timing_deviation_ms': 50, 'pitch_deviation_cents': 10},
-            {'detected_pitch': 'C4', 'timing_deviation_ms': -30, 'pitch_deviation_cents': -5},
-            {'detected_pitch': 'G4', 'timing_deviation_ms': 120, 'pitch_deviation_cents': 40},
-            {'detected_pitch': 'G4', 'timing_deviation_ms': 80, 'pitch_deviation_cents': -20},
+            {'timing_deviation_ms': 0, 'pitch_deviation_cents': 0},
+            {'timing_deviation_ms': 50, 'pitch_deviation_cents': 25},
+            {'timing_deviation_ms': 'MISSED', 'pitch_deviation_cents': 'MISSED'},
+            {'timing_deviation_ms': 200, 'pitch_deviation_cents': 150},
         ]
     }
     
     create_visual_analysis(test_melody, test_performance)
-    print("Test visualization created!")

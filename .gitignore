@@ -30,6 +30,7 @@ ENV/
 env.bak/
 venv.bak/
 .venv/
+test_env/
 
 # IDE
 .vscode/

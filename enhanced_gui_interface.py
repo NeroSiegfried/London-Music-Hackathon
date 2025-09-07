@@ -11,15 +11,19 @@ This enhanced version includes:
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+import matplotlib.patches as mpatches
 import numpy as np
 import json
 import threading
 import os
 import sys
+import time
+import traceback
+import re
 from pathlib import Path
 import pygame
 import librosa
@@ -28,14 +32,105 @@ import soundfile as sf
 # Import existing modules
 try:
     from enhanced_main_fixed import MusicAnalyzer, PIECES
-    from sheet_music_visualizer import SheetMusicVisualizer
-    from time_signature_analyzer import TimeSignatureAnalyzer
-    from polyphonic_analyzer import PolyphonicAnalyzer
-    from interactive_sheet_music import InteractiveSheetMusic
-    MODULES_AVAILABLE = True
+    MUSIC_ANALYZER_AVAILABLE = True
 except ImportError as e:
-    print(f"Warning: Could not import analysis modules: {e}")
-    MODULES_AVAILABLE = False
+    print(f"Warning: Could not import MusicAnalyzer: {e}")
+    MUSIC_ANALYZER_AVAILABLE = False
+    MusicAnalyzer = None
+    PIECES = {}
+
+try:
+    from sheet_music_visualizer import Music21SheetVisualizer, create_visual_analysis
+    SHEET_MUSIC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import sheet music visualizer: {e}")
+    SHEET_MUSIC_AVAILABLE = False
+    Music21SheetVisualizer = None
+
+try:
+    from time_signature_analyzer import TimeSignatureAnalyzer
+    TIME_ANALYZER_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import time signature analyzer: {e}")
+    TIME_ANALYZER_AVAILABLE = False
+    TimeSignatureAnalyzer = None
+
+try:
+    from polyphonic_analyzer import PolyphonicAnalyzer
+    POLYPHONIC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import polyphonic analyzer: {e}")
+    POLYPHONIC_AVAILABLE = False
+    PolyphonicAnalyzer = None
+
+class ImprovedPolyphonicAnalyzer:
+    """Optional polyphonic analyzer - enhances existing analysis without replacing it"""
+    
+    def __init__(self):
+        self.sample_rate = 22050
+        
+    def enhance_analysis(self, audio_path, existing_analysis, reference_mxl=None):
+        """Add polyphonic detection to existing analysis without replacing it"""
+        try:
+            import librosa
+            import numpy as np
+            
+            print("� Adding polyphonic enhancement to existing analysis...")
+            
+            # Load audio
+            y, sr = librosa.load(audio_path, sr=self.sample_rate)
+            
+            # Simple polyphonic detection using CQT
+            C = np.abs(librosa.cqt(y=y, sr=sr, fmin=librosa.note_to_hz('C2'), 
+                                   n_bins=72, bins_per_octave=12))
+            
+            # Find strong frequency components
+            threshold = np.percentile(C.flatten(), 85)
+            strong_frames = np.any(C > threshold, axis=1)
+            polyphonic_notes = np.sum(strong_frames)
+            
+            # Add to existing analysis
+            if 'enhanced_features' not in existing_analysis:
+                existing_analysis['enhanced_features'] = {}
+                
+            existing_analysis['enhanced_features']['polyphonic_detection'] = {
+                'detected_harmonics': int(polyphonic_notes),
+                'analysis_method': 'cqt_enhancement',
+                'confidence': 0.7
+            }
+            
+            print(f"🎵 Polyphonic enhancement added: {polyphonic_notes} harmonic components detected")
+            return existing_analysis
+            
+        except Exception as e:
+            print(f"⚠️ Polyphonic enhancement failed: {e}")
+            return existing_analysis
+    
+try:
+    IMPROVED_POLYPHONIC_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: Could not import time signature analyzer: {e}")
+    TIME_ANALYZER_AVAILABLE = False
+    TimeSignatureAnalyzer = None
+
+try:
+    from polyphonic_analyzer import PolyphonicAnalyzer
+    POLYPHONIC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import polyphonic analyzer: {e}")
+    POLYPHONIC_AVAILABLE = False
+    PolyphonicAnalyzer = None
+
+try:
+    from interactive_sheet_music import InteractiveSheetMusic
+    INTERACTIVE_SHEET_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import interactive sheet music: {e}")
+    INTERACTIVE_SHEET_AVAILABLE = False
+    InteractiveSheetMusic = None
+
+MODULES_AVAILABLE = (MUSIC_ANALYZER_AVAILABLE and SHEET_MUSIC_AVAILABLE and 
+                    TIME_ANALYZER_AVAILABLE and POLYPHONIC_AVAILABLE)
 
 class EnhancedABRSMGUI:
     def __init__(self, root):
@@ -50,6 +145,12 @@ class EnhancedABRSMGUI:
         # Initialize pygame for audio playback
         pygame.mixer.init()
         
+        # Initialize improved polyphonic analyzer
+        if IMPROVED_POLYPHONIC_AVAILABLE:
+            self.improved_analyzer = ImprovedPolyphonicAnalyzer()
+        else:
+            self.improved_analyzer = None
+        
         # Analysis state
         self.current_analysis = None
         self.current_audio_file = None
@@ -59,6 +160,7 @@ class EnhancedABRSMGUI:
         
         # Setup enhanced GUI
         self.setup_styles()
+        self.load_available_midi_files()  # Load MIDI files dynamically
         self.create_enhanced_widgets()
         self.create_enhanced_menu()
         
@@ -77,6 +179,35 @@ class EnhancedABRSMGUI:
         style.configure('Poor.TLabel', foreground='orange', font=('Arial', 10, 'bold'))
         style.configure('Missed.TLabel', foreground='red', font=('Arial', 10, 'bold'))
         
+    def load_available_midi_files(self):
+        """Dynamically load all MIDI files from the midi folder"""
+        self.available_pieces = {}
+        midi_folder = "midi"
+        
+        if os.path.exists(midi_folder):
+            for filename in os.listdir(midi_folder):
+                if filename.endswith('.mid') or filename.endswith('.midi'):
+                    # Extract piece name from filename
+                    piece_name = filename.replace('.mid', '').replace('.midi', '').replace('_reference', '')
+                    piece_key = piece_name.lower().replace(' ', '_').replace('-', '_')
+                    
+                    # Create a basic piece structure
+                    self.available_pieces[piece_key] = {
+                        'title': piece_name.replace('_', ' ').title(),
+                        'midi_file': os.path.join(midi_folder, filename),
+                        'melody': []  # Will be populated from MIDI if needed
+                    }
+        
+        # Merge with existing PIECES if available
+        if MODULES_AVAILABLE and hasattr(sys.modules[__name__], 'PIECES'):
+            self.available_pieces.update(PIECES)
+        
+        print(f"✓ Loaded {len(self.available_pieces)} available pieces: {list(self.available_pieces.keys())}")
+        
+    def get_available_pieces(self):
+        """Get list of available piece keys"""
+        return list(self.available_pieces.keys())
+        
     def create_enhanced_menu(self):
         """Create enhanced menu bar with additional options"""
         menubar = tk.Menu(self.root)
@@ -87,6 +218,8 @@ class EnhancedABRSMGUI:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open Audio File", command=self.open_audio_file)
         file_menu.add_command(label="Load Demo", command=self.load_demo)
+        file_menu.add_separator()
+        file_menu.add_command(label="Load XML Template", command=self.load_xml_template)
         file_menu.add_separator()
         file_menu.add_command(label="Export Analysis", command=self.export_analysis)
         file_menu.add_command(label="Export Detailed Report", command=self.export_detailed_report)
@@ -156,9 +289,9 @@ class EnhancedABRSMGUI:
         piece_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         
         ttk.Label(piece_frame, text="Reference Piece:").pack(side=tk.LEFT)
-        self.piece_var = tk.StringVar(value="twinkle")
+        self.piece_var = tk.StringVar(value=list(self.available_pieces.keys())[0] if self.available_pieces else "twinkle")
         piece_combo = ttk.Combobox(piece_frame, textvariable=self.piece_var, 
-                                   values=list(PIECES.keys()), state='readonly')
+                                   values=list(self.available_pieces.keys()), state='readonly')
         piece_combo.pack(side=tk.LEFT, padx=(10, 0))
         
         # Analysis buttons
@@ -173,6 +306,8 @@ class EnhancedABRSMGUI:
                   command=self.detect_mistake_patterns).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="📊 Performance Diff", 
                   command=self.show_performance_diff).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="⚙️ Batch Process", 
+                  command=self.batch_process_csv).pack(side=tk.LEFT, padx=5)
         
         # Progress bar
         self.progress = ttk.Progressbar(control_frame, mode='indeterminate')
@@ -373,19 +508,239 @@ class EnhancedABRSMGUI:
         self.metrics_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
     def create_sheet_music_tab(self):
-        """Create enhanced interactive sheet music tab"""
+        """Create enhanced interactive sheet music tab with proper third-party visualization"""
         sheet_frame = ttk.Frame(self.notebook)
         self.notebook.add(sheet_frame, text="🎼 Sheet")
         
-        # Create interactive sheet music widget
-        self.interactive_sheet = InteractiveSheetMusic(sheet_frame, 
-                                                      on_note_click=self.on_sheet_note_click)
+        # Create sheet music controls
+        controls_frame = ttk.Frame(sheet_frame)
+        controls_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        # Add controls (placeholder for future implementation)
-        # self.interactive_sheet.add_controls(sheet_frame)
+        ttk.Button(controls_frame, text="🔄 Refresh Sheet Music", 
+                  command=self.refresh_sheet_music).pack(side=tk.LEFT, padx=5)
+        ttk.Button(controls_frame, text="💾 Export Sheet", 
+                  command=self.export_sheet_music).pack(side=tk.LEFT, padx=5)
         
-        # Add controls (placeholder for future implementation)
-        # self.interactive_sheet.add_controls(sheet_frame)
+        # Time signature selection for songs without MIDI
+        ttk.Label(controls_frame, text="Time Signature:").pack(side=tk.LEFT, padx=(20, 5))
+        self.time_sig_var = tk.StringVar(value="4/4")
+        time_sig_combo = ttk.Combobox(controls_frame, textvariable=self.time_sig_var, 
+                                     values=["4/4", "3/4", "2/4", "6/8", "9/8", "12/8"], 
+                                     state='readonly', width=8)
+        time_sig_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Sheet music display area
+        self.sheet_canvas_frame = ttk.Frame(sheet_frame)
+        self.sheet_canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Create matplotlib figure for sheet music
+        self.sheet_fig = Figure(figsize=(12, 8), dpi=100)
+        self.sheet_canvas = FigureCanvasTkAgg(self.sheet_fig, self.sheet_canvas_frame)
+        self.sheet_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Add toolbar
+        sheet_toolbar = NavigationToolbar2Tk(self.sheet_canvas, self.sheet_canvas_frame)
+        sheet_toolbar.update()
+        
+        # Initialize empty sheet
+        self.refresh_sheet_music()
+    
+    def refresh_sheet_music(self):
+        """Refresh sheet music display with template vs performance comparison"""
+        try:
+            self.sheet_fig.clear()
+            
+            if self.current_analysis and MODULES_AVAILABLE:
+                # Create two subplots: template and performance
+                gs = self.sheet_fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
+                
+                # Get current piece info
+                piece_key = self.piece_var.get()
+                piece_info = PIECES.get(piece_key, {})
+                reference_melody = piece_info.get('melody', [])
+                
+                if reference_melody and self.current_analysis:
+                    # Get analysis data
+                    if 'standard_analysis' in self.current_analysis:
+                        analysis_data = self.current_analysis['standard_analysis']
+                    else:
+                        analysis_data = self.current_analysis
+                    
+                    note_details = analysis_data.get('note_details', [])
+                    
+                    # Template sheet music (top)
+                    ax1 = self.sheet_fig.add_subplot(gs[0])
+                    self._draw_sheet_music(ax1, reference_melody, note_details, "template")
+                    ax1.set_title("Template (Expected Performance)", fontsize=12, fontweight='bold')
+                    
+                    # Performance sheet music (bottom) 
+                    ax2 = self.sheet_fig.add_subplot(gs[1])
+                    self._draw_sheet_music(ax2, reference_melody, note_details, "performance")
+                    ax2.set_title("Your Performance", fontsize=12, fontweight='bold')
+                    
+                    # Add overall legend
+                    legend_elements = [
+                        mpatches.Patch(facecolor='red', label='Missed Notes'),
+                        mpatches.Patch(facecolor='orange', label='Timing Issues'),
+                        mpatches.Patch(facecolor='blue', label='Pitch Issues'), 
+                        mpatches.Patch(facecolor='green', label='Correct Notes'),
+                        mpatches.Patch(facecolor='purple', label='Extra Notes')
+                    ]
+                    self.sheet_fig.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98))
+                    
+                else:
+                    # Fallback display
+                    ax = self.sheet_fig.add_subplot(111)
+                    ax.text(0.5, 0.5, f"No melody data available for {piece_key}\nLoad a piece with melody data", 
+                           ha='center', va='center', fontsize=12, transform=ax.transAxes)
+                    ax.axis('off')
+            else:
+                # No analysis available
+                ax = self.sheet_fig.add_subplot(111)
+                ax.text(0.5, 0.5, "Run analysis to display sheet music\nwith performance differences", 
+                       ha='center', va='center', fontsize=12, transform=ax.transAxes)
+                ax.set_title("Sheet Music Visualization", fontsize=14, fontweight='bold')
+                ax.axis('off')
+            
+            self.sheet_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error refreshing sheet music: {e}")
+            import traceback
+            traceback.print_exc()
+            # Show error message on canvas
+            self.sheet_fig.clear()
+            ax = self.sheet_fig.add_subplot(111)
+            ax.text(0.5, 0.5, f"Error generating sheet music:\n{str(e)}", 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=10, color='red')
+            ax.set_title("Sheet Music Error", fontsize=14)
+            ax.axis('off')
+            self.sheet_canvas.draw()
+    
+    def _draw_sheet_music(self, ax, melody_data, note_details, view_type):
+        """Draw sheet music notation with color coding"""
+        # Draw staff lines
+        staff_y = 2
+        staff_width = len(melody_data) * 0.8 + 2
+        
+        for i in range(5):
+            y = staff_y + i * 0.5
+            ax.plot([0.5, staff_width], [y, y], color='black', linewidth=1)
+        
+        # Draw treble clef
+        ax.text(0.7, staff_y + 1, '𝄞', fontsize=30, va='center', ha='center')
+        
+        # Draw notes
+        x_pos = 1.5
+        note_spacing = 0.8
+        
+        for i, note_data in enumerate(melody_data):
+            # Get analysis info for this note
+            note_detail = None
+            if i < len(note_details):
+                note_detail = note_details[i]
+            
+            # Calculate note position on staff
+            midi_pitch = note_data['pitch']
+            # C4 (MIDI 60) is on ledger line below staff
+            y_pos = staff_y + (midi_pitch - 60) * 0.25
+            
+            # Determine color based on view type and analysis
+            if view_type == "template":
+                # Template view: show missed notes in red, others in black
+                if note_detail and note_detail.get('timing_deviation_ms') == 'MISSED':
+                    color = 'red'
+                else:
+                    color = 'black'
+            else:
+                # Performance view: color code based on accuracy
+                if note_detail:
+                    if note_detail.get('timing_deviation_ms') == 'MISSED':
+                        continue  # Don't draw missed notes in performance view
+                    elif isinstance(note_detail.get('timing_deviation_ms'), (int, float)) and abs(note_detail.get('timing_deviation_ms', 0)) > 100:
+                        color = 'orange'  # Timing issues
+                    elif isinstance(note_detail.get('pitch_deviation_cents'), (int, float)) and abs(note_detail.get('pitch_deviation_cents', 0)) > 50:
+                        color = 'blue'  # Pitch issues
+                    else:
+                        color = 'green'  # Correct
+                else:
+                    color = 'purple'  # Extra notes
+            
+            # Draw note head
+            circle = plt.Circle((x_pos, y_pos), 0.12, color=color, fill=True)
+            ax.add_patch(circle)
+            
+            # Draw stem
+            stem_height = 1.5 if y_pos < staff_y + 2 else -1.5
+            stem_x = x_pos + (0.12 if stem_height > 0 else -0.12)
+            ax.plot([stem_x, stem_x], [y_pos, y_pos + stem_height], color=color, linewidth=2)
+            
+            # Add ledger lines if needed
+            if y_pos < staff_y - 0.1:
+                for ledger_y in np.arange(staff_y - 0.5, y_pos - 0.1, -0.5):
+                    ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
+            elif y_pos > staff_y + 2.1:
+                for ledger_y in np.arange(staff_y + 2.5, y_pos + 0.1, 0.5):
+                    ax.plot([x_pos - 0.2, x_pos + 0.2], [ledger_y, ledger_y], color='black', linewidth=1)
+            
+            x_pos += note_spacing
+        
+        # Set axis properties
+        ax.set_xlim(0, staff_width + 0.5)
+        ax.set_ylim(staff_y - 2, staff_y + 4.5)
+        ax.set_aspect('equal')
+        ax.axis('off')
+    
+    def extract_melody_from_midi(self, piece_key):
+        """Extract melody from MIDI file if available"""
+        try:
+            if piece_key in self.available_pieces and 'midi_file' in self.available_pieces[piece_key]:
+                midi_path = self.available_pieces[piece_key]['midi_file']
+                if os.path.exists(midi_path):
+                    import mido
+                    mid = mido.MidiFile(midi_path)
+                    
+                    melody = []
+                    current_time = 0.0
+                    ticks_per_beat = mid.ticks_per_beat
+                    tempo = 500000  # Default 120 BPM
+                    
+                    for track in mid.tracks:
+                        for msg in track:
+                            current_time += msg.time
+                            if msg.type == 'set_tempo':
+                                tempo = msg.tempo
+                            elif msg.type == 'note_on' and msg.velocity > 0:
+                                # Convert MIDI to melody format
+                                time_in_beats = current_time / ticks_per_beat
+                                melody.append({
+                                    'pitch': msg.note,
+                                    'duration': 0.25,  # Default quarter note
+                                    'time': time_in_beats
+                                })
+                    
+                    return melody[:16]  # Limit to first 16 notes for display
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error extracting melody from MIDI: {e}")
+            return None
+    
+    def export_sheet_music(self):
+        """Export current sheet music as PNG"""
+        try:
+            if hasattr(self, 'sheet_fig'):
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".png",
+                    filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+                    title="Export Sheet Music"
+                )
+                if filename:
+                    self.sheet_fig.savefig(filename, dpi=300, bbox_inches='tight')
+                    messagebox.showinfo("Success", f"Sheet music exported to:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export sheet music:\n{str(e)}")
         
     def on_sheet_note_click(self, note_index, is_performance=False, is_reference=False):
         """Handle clicks on sheet music notes with proper selection and playback options"""
@@ -521,9 +876,10 @@ class EnhancedABRSMGUI:
                     y = y[start_sample:]
             
             # Save and play
-            temp_path = "temp_playback.wav"
+            temp_path = "temp_performance_playback.wav"
             sf.write(temp_path, y, sr)
             
+            pygame.mixer.music.stop()
             pygame.mixer.music.load(temp_path)
             pygame.mixer.music.play()
             
@@ -541,10 +897,15 @@ class EnhancedABRSMGUI:
                 self.play_both_from_selection()
                 return
                 
-            # Get the piece melody
-            piece_key = self.piece_var.get()
-            piece_info = PIECES.get(piece_key, {})
-            melody = piece_info.get('melody', [])
+            # Get reference melody from current analysis or MIDI template
+            melody = []
+            if self.current_analysis and 'reference_melody' in self.current_analysis:
+                melody = self.current_analysis['reference_melody']
+            else:
+                # Fallback to PIECES dictionary
+                piece_key = self.piece_var.get()
+                piece_info = PIECES.get(piece_key, {})
+                melody = piece_info.get('melody', [])
             
             # Generate reference tones from selected note to end
             start_idx = self.selected_note_index if self.play_from_selection.get() else 0
@@ -557,6 +918,20 @@ class EnhancedABRSMGUI:
                 }
                 # Generate and play reference audio
                 self.generate_and_play_reference(piece_info_to_play)
+            else:
+                # If no melody available, try to play the current reference MIDI file
+                midi_template = self.piece_var.get()
+                if midi_template and midi_template != "Select template":
+                    midi_path = os.path.join("midi", midi_template)
+                    if os.path.exists(midi_path):
+                        # Convert MIDI to audio and play
+                        reference_audio_path = midi_path.replace('.mid', '_reference.wav').replace('.midi', '_reference.wav')
+                        if os.path.exists(reference_audio_path):
+                            pygame.mixer.music.stop()
+                            pygame.mixer.music.load(reference_audio_path)
+                            pygame.mixer.music.play()
+                        else:
+                            print(f"Reference audio not found: {reference_audio_path}")
             
         except Exception as e:
             print(f"Error playing reference: {e}")
@@ -1103,6 +1478,37 @@ This analysis looks for sections where the performer may have:
         if note_numbers:
             # Create scatter plot
             colors = []
+            for pitch_err, timing_err in zip(pitch_errors, timing_errors):
+                if abs(pitch_err) < 25 and abs(timing_err) < 50:
+                    colors.append('green')
+                elif abs(pitch_err) < 50 and abs(timing_err) < 100:
+                    colors.append('blue')
+                elif abs(pitch_err) < 100 and abs(timing_err) < 200:
+                    colors.append('orange')
+                else:
+                    colors.append('red')
+            
+            scatter = ax.scatter(timing_errors, pitch_errors, c=colors, alpha=0.7, s=50)
+            
+            # Add note numbers as labels
+            for i, (x, y, note_num) in enumerate(zip(timing_errors, pitch_errors, note_numbers)):
+                ax.annotate(str(note_num), (x, y), xytext=(5, 5), textcoords='offset points', fontsize=8)
+            
+            ax.set_xlabel('Timing Error (ms)')
+            ax.set_ylabel('Pitch Error (cents)')
+            ax.set_title('Performance Accuracy: Pitch vs Timing')
+            ax.grid(True, alpha=0.3)
+            
+            # Add accuracy zones
+            ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            ax.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+            ax.axhspan(-25, 25, alpha=0.1, color='green', label='Excellent pitch')
+            ax.axvspan(-50, 50, alpha=0.1, color='green', label='Excellent timing')
+            
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, 'No pitch/timing data available', 
+                   ha='center', va='center', transform=ax.transAxes)
             for p, t in zip(pitch_errors, timing_errors):
                 if abs(p) < 20 and abs(t) < 50:
                     colors.append('green')
@@ -1143,7 +1549,9 @@ This analysis looks for sections where the performer may have:
             note_details = self.current_analysis.get("standard_analysis", {}).get("note_details", [])
             if self.selected_note_index < len(note_details):
                 note = note_details[self.selected_note_index]
-                start_time = note.get('detected_time', 0)
+                start_time = note.get('actual_time', 0)
+                
+                print(f"🎵 Playing note {self.selected_note_index + 1} at time {start_time:.2f}s")
                 
                 # Improved note extraction with onset-based boundaries
                 # Get all onsets to find natural note boundaries
@@ -1209,12 +1617,24 @@ This analysis looks for sections where the performer may have:
             return
             
         try:
-            # Get the expected pitch for the selected note
-            piece_melody = PIECES[self.piece_var.get()]['melody']
-            if self.selected_note_index < len(piece_melody):
-                ref_note = piece_melody[self.selected_note_index]
-                pitch_midi = ref_note['pitch']
-                duration = ref_note['duration'] * 4 * (60.0 / 100)  # Convert to seconds (using default tempo)
+            # Get the expected pitch for the selected note from analysis
+            note_details = self.current_analysis.get("standard_analysis", {}).get("note_details", [])
+            if self.selected_note_index < len(note_details):
+                note = note_details[self.selected_note_index]
+                expected_pitch = note.get('expected_pitch', 'C4')
+                
+                # Convert pitch name to MIDI if needed
+                if isinstance(expected_pitch, str):
+                    try:
+                        import music21
+                        pitch_midi = music21.pitch.Pitch(expected_pitch).midi
+                    except:
+                        pitch_midi = 60  # Default to middle C
+                else:
+                    pitch_midi = expected_pitch
+                
+                print(f"🎵 Playing reference note: {expected_pitch} (MIDI {pitch_midi})")
+                duration = 1.0  # Default duration
                 
                 # Generate reference tone
                 freq = librosa.midi_to_hz(pitch_midi)
@@ -1347,7 +1767,7 @@ This analysis looks for sections where the performer may have:
     
     def load_demo(self):
         """Load demo file"""
-        demo_file = "demo_performance.wav"
+        demo_file = "audio/demo_performance.wav"  # Updated path
         if os.path.exists(demo_file):
             self.current_audio_file = demo_file
             self.file_label.config(text=demo_file)
@@ -1392,18 +1812,28 @@ This analysis looks for sections where the performer may have:
                 if MODULES_AVAILABLE:
                     analyzer = MusicAnalyzer(piece_key=self.piece_var.get())
                     
-                    # Disable visualizations to prevent matplotlib threading issues
+                    # Use original analysis method (your DWT algorithm)
                     result = analyzer.analyze_with_enhancements(
                         self.current_audio_file, 
                         generate_visualizations=False,  # Disable to prevent threading issues
-                        detect_polyphony=False,         # Disable to speed up
-                        analyze_timing=False            # Disable to speed up
+                        detect_polyphony=True,          # Enable polyphony detection
+                        analyze_timing=True             # Enable timing analysis
                     )
                     
                     # The method returns (f0, times, onsets, enhanced_analysis)
                     if result and len(result) == 4:
                         f0, times, onsets, enhanced_analysis = result
                         self.current_analysis = enhanced_analysis
+                        
+                        # Optional: Try polyphonic enhancement if available
+                        if hasattr(self, 'improved_analyzer') and self.improved_analyzer:
+                            try:
+                                print("� Adding polyphonic enhancement...")
+                                enhanced_analysis = self.improved_analyzer.enhance_analysis(
+                                    self.current_audio_file, enhanced_analysis
+                                )
+                            except Exception as e:
+                                print(f"⚠️ Polyphonic enhancement failed: {e}")
                     else:
                         messagebox.showerror("Analysis Error", "Analysis returned unexpected format")
                         return
@@ -1440,19 +1870,12 @@ This analysis looks for sections where the performer may have:
             return
             
         try:
+            # Clear the figure first
+            self.sheet_fig.clear()
+            
             # Get the current piece information
             piece_key = self.piece_var.get()
             piece_info = PIECES.get(piece_key, {})
-            
-            if piece_info and hasattr(self, 'interactive_sheet'):
-                # Update the interactive sheet music
-                self.interactive_sheet.update_sheet_music(
-                    piece_info, 
-                    self.current_analysis, 
-                    self.interactive_sheet.view_mode
-                )
-        except Exception as e:
-            print(f"Error updating sheet music: {e}")
             
             # Get the analysis data
             standard_analysis = self.current_analysis.get("standard_analysis", {})
@@ -1467,33 +1890,122 @@ This analysis looks for sections where the performer may have:
                 ax.set_ylim(0, 1)
                 ax.axis('off')
             else:
-                # Use the sheet music visualizer without ax parameter
-                from sheet_music_visualizer import create_visual_analysis
+                # Create two subplots for template vs performance comparison
+                ax1 = self.sheet_fig.add_subplot(2, 1, 1)
+                ax2 = self.sheet_fig.add_subplot(2, 1, 2)
                 
-                # Extract melody data for visualization
-                reference_melody = []
-                performance_report = {"note_details": note_details}
+                # Extract template melody from piece info
+                template_melody = piece_info.get('melody', [])
                 
-                # Create the visualization and load it as image
-                output_path = create_visual_analysis(reference_melody, performance_report)
+                if template_melody:
+                    # Plot template (reference)
+                    ax1.set_title("Reference Template", fontsize=12, fontweight='bold')
+                    times = [note.get('start_time', 0) for note in template_melody]
+                    pitches = []
+                    durations = [note.get('duration', 0.5) for note in template_melody]
+                    
+                    # Convert pitches to MIDI numbers
+                    for note in template_melody:
+                        pitch = note.get('pitch', 60)
+                        if isinstance(pitch, str):
+                            try:
+                                import music21
+                                pitch = music21.pitch.Pitch(pitch).midi
+                            except:
+                                pitch = 60  # Default to middle C
+                        pitches.append(pitch)
+                    
+                    # Create horizontal bars for note durations
+                    for i, (time, pitch, duration) in enumerate(zip(times, pitches, durations)):
+                        ax1.barh(pitch, duration, left=time, height=0.8, 
+                                alpha=0.7, color='blue', label='Template' if i == 0 else "")
+                    
+                    # Plot performance
+                    ax2.set_title("Your Performance", fontsize=12, fontweight='bold')
+                    perf_times = []
+                    perf_pitches = []
+                    perf_colors = []
+                    
+                    for detail in note_details:
+                        if 'actual_pitch' in detail and 'actual_time' in detail:
+                            # Convert pitch names to MIDI numbers if needed
+                            actual_pitch = detail['actual_pitch']
+                            if isinstance(actual_pitch, str):
+                                try:
+                                    import music21
+                                    actual_pitch = music21.pitch.Pitch(actual_pitch).midi
+                                except:
+                                    actual_pitch = 60  # Default to middle C
+                            
+                            perf_times.append(detail['actual_time'])
+                            perf_pitches.append(actual_pitch)
+                            
+                            # Color code by pitch accuracy
+                            pitch_error = abs(detail.get('pitch_deviation_cents', 100))
+                            if pitch_error < 50:  # Less than 50 cents
+                                perf_colors.append('green')
+                            elif pitch_error < 100:  # Less than 100 cents
+                                perf_colors.append('orange')
+                            else:
+                                perf_colors.append('red')
+                    
+                    # Plot performance notes with color coding
+                    for i, (time, pitch, color) in enumerate(zip(perf_times, perf_pitches, perf_colors)):
+                        duration = 0.5  # Default duration for visualization
+                        ax2.barh(pitch, duration, left=time, height=0.8, 
+                                alpha=0.7, color=color)
+                    
+                    # Set labels and formatting
+                    ax1.set_ylabel('MIDI Pitch')
+                    ax2.set_ylabel('MIDI Pitch') 
+                    ax2.set_xlabel('Time (seconds)')
+                    
+                    # Add legend for performance colors
+                    from matplotlib.patches import Patch
+                    legend_elements = [
+                        Patch(facecolor='green', alpha=0.7, label='Excellent'),
+                        Patch(facecolor='orange', alpha=0.7, label='Good'),
+                        Patch(facecolor='red', alpha=0.7, label='Poor/Missed')
+                    ]
+                    ax2.legend(handles=legend_elements, loc='upper right')
+                    
+                    # Set reasonable axis limits
+                    all_pitches = pitches + perf_pitches
+                    if all_pitches:
+                        pitch_min, pitch_max = min(all_pitches), max(all_pitches)
+                        pitch_range = pitch_max - pitch_min
+                        ax1.set_ylim(pitch_min - pitch_range*0.1, pitch_max + pitch_range*0.1)
+                        ax2.set_ylim(pitch_min - pitch_range*0.1, pitch_max + pitch_range*0.1)
+                    
+                    all_times = times + perf_times
+                    if all_times:
+                        time_max = max(all_times + [sum(durations)])
+                        ax1.set_xlim(0, time_max * 1.1)
+                        ax2.set_xlim(0, time_max * 1.1)
                 
-                if output_path and os.path.exists(output_path):
-                    # Load and display the generated image
-                    import matplotlib.image as mpimg
-                    ax = self.sheet_fig.add_subplot(111)
-                    img = mpimg.imread(output_path)
-                    ax.imshow(img)
-                    ax.axis('off')
                 else:
-                    # Fallback message
+                    # No template available - show performance only
                     ax = self.sheet_fig.add_subplot(111)
-                    ax.text(0.5, 0.5, "Sheet music visualization not available", 
-                           ha='center', va='center', fontsize=14, transform=ax.transAxes)
+                    ax.text(0.5, 0.5, "Template melody not available\nShowing performance analysis only", 
+                           ha='center', va='center', fontsize=12, transform=ax.transAxes)
                     ax.set_xlim(0, 1)
                     ax.set_ylim(0, 1)
                     ax.axis('off')
             
-            # Refresh the canvas
+            # Adjust layout and refresh
+            self.sheet_fig.tight_layout()
+            self.sheet_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error updating sheet music: {e}")
+            # Show error message
+            self.sheet_fig.clear()
+            ax = self.sheet_fig.add_subplot(111)
+            ax.text(0.5, 0.5, f"Error displaying sheet music:\n{str(e)}", 
+                   ha='center', va='center', fontsize=12, transform=ax.transAxes)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.axis('off')
             self.sheet_canvas.draw()
             
         except Exception as e:
@@ -1522,9 +2034,11 @@ This analysis looks for sections where the performer may have:
         for note in note_details:
             note_num = note.get('note_index', 'N/A')
             expected_pitch = note.get('expected_pitch', 'N/A')
-            detected_pitch = note.get('actual_pitch', 'N/A')  # Fixed field name
+            detected_pitch = note.get('actual_pitch', 'N/A')
             pitch_error = note.get('pitch_deviation_cents', 'N/A')
             timing_error = note.get('timing_deviation_ms', 'N/A')
+            expected_time = note.get('expected_time', 'N/A')
+            actual_time = note.get('actual_time', 'N/A')
             
             # Enhanced analysis
             duration = "Normal"  # Placeholder
@@ -1672,19 +2186,13 @@ This analysis looks for sections where the performer may have:
             
             # Get performance notes from analysis (the correct source)
             analysis_data = self.current_analysis.get("standard_analysis", {})
-            performance_notes = analysis_data.get("performance_notes", [])
+            note_details = analysis_data.get("note_details", [])
             
-            if self.selected_note_index >= len(performance_notes):
-                # Fallback to note_details if performance_notes not available
-                note_details = analysis_data.get("note_details", [])
-                if self.selected_note_index >= len(note_details):
-                    return
-                note = note_details[self.selected_note_index]
-                start_time = note.get('actual_time', 0)
-            else:
-                # Use performance notes data (preferred)
-                perf_note = performance_notes[self.selected_note_index]
-                start_time = perf_note.get('onset', 0)
+            if self.selected_note_index >= len(note_details):
+                return
+                
+            note = note_details[self.selected_note_index]
+            start_time = note.get('actual_time', 0)
             
             # Use the same improved segmentation as play_selected_note
             onsets = librosa.onset.onset_detect(y=y, sr=sr, units='time')
@@ -1864,6 +2372,261 @@ This analysis looks for sections where the performer may have:
     def export_analysis(self):
         """Export basic analysis"""
         pass
+    
+    def batch_process_csv(self):
+        """Batch process all entries in the CSV file with non-empty J columns"""
+        import csv
+        from datetime import datetime
+        
+        csv_file = "data/abrsm_lmth25.csv"
+        if not os.path.exists(csv_file):
+            messagebox.showerror("Error", f"CSV file not found: {csv_file}")
+            return
+        
+        # Create progress dialog
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Batch Processing")
+        progress_window.geometry("500x300")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+        
+        # Progress text area
+        progress_text = scrolledtext.ScrolledText(progress_window, height=15, width=60)
+        progress_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Progress bar
+        batch_progress = ttk.Progressbar(progress_window, mode='determinate')
+        batch_progress.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        def log_progress(message):
+            progress_text.insert(tk.END, message + "\n")
+            progress_text.see(tk.END)
+            progress_window.update()
+        
+        def process_batch():
+            try:
+                # Read CSV file
+                import csv
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    data = list(reader)
+                log_progress(f"✓ Loaded CSV with {len(data)} entries")
+                
+                # Filter entries with non-empty feedback (column J = feedback)
+                valid_entries = [row for row in data if row.get('feedback', '').strip()]
+                log_progress(f"✓ Found {len(valid_entries)} entries with feedback")
+                
+                batch_progress['maximum'] = len(valid_entries)
+                training_data = []
+                
+                for idx, row in valid_entries.iterrows():
+                    try:
+                        performance_id = row['performance_id']
+                        log_progress(f"Processing {performance_id}...")
+                        
+                        # Look for audio files
+                        audio1_path = f"audio/{performance_id}_1.mp3"
+                        audio2_path = f"audio/{performance_id}_2.mp3"
+                        
+                        piece1_features = None
+                        piece2_features = None
+                        
+                        # Process piece 1
+                        if os.path.exists(audio1_path):
+                            piece1_features = self.analyze_audio_file(
+                                audio1_path, 
+                                row['title_piece_1'], 
+                                row['composer_piece_1']
+                            )
+                            log_progress(f"  ✓ Analyzed piece 1: {row['title_piece_1']}")
+                        else:
+                            log_progress(f"  ⚠️  Audio file not found: {audio1_path}")
+                        
+                        # Process piece 2
+                        if os.path.exists(audio2_path):
+                            piece2_features = self.analyze_audio_file(
+                                audio2_path, 
+                                row['title_piece_2'], 
+                                row['composer_piece_2']
+                            )
+                            log_progress(f"  ✓ Analyzed piece 2: {row['title_piece_2']}")
+                        else:
+                            log_progress(f"  ⚠️  Audio file not found: {audio2_path}")
+                        
+                        # Create training data entry
+                        training_entry = {
+                            'performance_id': performance_id,
+                            'age_group': row['age_group'],
+                            'ability_group': row['ability_group'],
+                            'title_piece_1': row['title_piece_1'],
+                            'composer_piece_1': row['composer_piece_1'],
+                            'title_piece_2': row['title_piece_2'],
+                            'composer_piece_2': row['composer_piece_2'],
+                            'mark': row['mark'],
+                            'feedback': row['feedback'],
+                            'piece1_features': piece1_features,
+                            'piece2_features': piece2_features
+                        }
+                        
+                        training_data.append(training_entry)
+                        batch_progress['value'] = len(training_data)
+                        batch_progress.update()
+                        
+                    except Exception as e:
+                        log_progress(f"  ❌ Error processing {performance_id}: {str(e)}")
+                        continue
+                
+                # Save training data
+                output_file = "data/training_data.json"
+                with open(output_file, 'w') as f:
+                    json.dump(training_data, f, indent=2, default=str)
+                
+                log_progress(f"\n✅ Batch processing complete!")
+                log_progress(f"✓ Processed {len(training_data)} entries")
+                log_progress(f"✓ Training data saved to: {output_file}")
+                
+            except Exception as e:
+                log_progress(f"❌ Batch processing failed: {str(e)}")
+        
+        # Start processing in a separate thread
+        threading.Thread(target=process_batch, daemon=True).start()
+    
+    def analyze_audio_file(self, audio_path, title, composer):
+        """Analyze a single audio file and return features"""
+        try:
+            # Find matching MIDI template
+            template_key = None
+            midi_path = None
+            used_midi = True
+            
+            # Try to find matching MIDI file
+            for piece_key, piece_info in self.available_pieces.items():
+                if (title.lower() in piece_info['title'].lower() or 
+                    piece_info['title'].lower() in title.lower()):
+                    template_key = piece_key
+                    if 'midi_file' in piece_info:
+                        midi_path = piece_info['midi_file']
+                    break
+            
+            # If no MIDI found, use MP3 template analysis (stub for now)
+            if not midi_path:
+                used_midi = False
+                return self.analyze_with_mp3_template(audio_path, title, composer)
+            
+            # Perform analysis with MIDI template
+            if MODULES_AVAILABLE:
+                analyzer = MusicAnalyzer(piece_key=template_key)
+                results = analyzer.compare_performances(audio_path)
+                
+                if results:
+                    features = {
+                        'title': title,
+                        'composer': composer,
+                        'used_midi_template': used_midi,
+                        'midi_template_path': midi_path,
+                        'analysis_results': results,
+                        'audio_path': audio_path
+                    }
+                    return features
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error analyzing {audio_path}: {e}")
+            return None
+    
+    def analyze_with_mp3_template(self, audio_path, title, composer):
+        """Stub for MP3 template analysis - to be implemented later"""
+        from datetime import datetime
+        return {
+            'title': title,
+            'composer': composer,
+            'used_midi_template': False,
+            'mp3_template_analysis': True,
+            'audio_path': audio_path,
+            'analysis_results': {
+                'note': 'MP3 template analysis not yet implemented',
+                'timestamp': str(datetime.now())
+            }
+        }
+    
+    def load_xml_template(self):
+        """Load an XML template file and add it to available pieces"""
+        try:
+            # File dialog for XML files
+            filetypes = [
+                ("XML files", "*.xml *.mxl *.musicxml"),
+                ("All files", "*.*")
+            ]
+            filename = filedialog.askopenfilename(
+                title="Select XML Template File", 
+                filetypes=filetypes
+            )
+            
+            if not filename:
+                return
+            
+            # Get template name from user
+            template_name = tk.simpledialog.askstring(
+                "Template Name", 
+                "Enter a name for this template:",
+                initialvalue=os.path.splitext(os.path.basename(filename))[0]
+            )
+            
+            if not template_name:
+                return
+            
+            # Parse the XML file using our musicxml_parser
+            from musicxml_parser import extract_melody_from_musicxml, get_musicxml_tempo
+            
+            print(f"📋 Loading XML template: {filename}")
+            melody_notes = extract_melody_from_musicxml(filename)
+            
+            if not melody_notes:
+                messagebox.showerror("Error", "Could not extract melody from XML file")
+                return
+            
+            # Get tempo from XML or use default
+            tempo = get_musicxml_tempo(filename)
+            
+            # Create template entry
+            template_key = template_name.lower().replace(' ', '_')
+            new_template = {
+                'title': template_name,
+                'composer': 'Custom',
+                'tempo': tempo,
+                'time_signature': (4, 4),  # Default
+                'melody': melody_notes,
+                'source_file': filename
+            }
+            
+            # Add to PIECES dictionary (import it to modify)
+            global PIECES
+            PIECES[template_key] = new_template
+            
+            # Update the piece selection dropdown
+            if hasattr(self, 'piece_var'):
+                current_values = list(self.piece_combo['values'])
+                if template_key not in current_values:
+                    new_values = current_values + [template_key]
+                    self.piece_combo['values'] = new_values
+                    self.piece_var.set(template_key)  # Select the new template
+            
+            messagebox.showinfo(
+                "Success", 
+                f"Template '{template_name}' loaded successfully!\n"
+                f"Notes: {len(melody_notes)}\n"
+                f"Tempo: {tempo} BPM\n"
+                f"Duration: {melody_notes[-1]['start_time'] + melody_notes[-1]['duration']:.1f}s"
+            )
+            
+            print(f"✅ Template '{template_name}' added to pieces ({len(melody_notes)} notes)")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load XML template: {e}")
+            print(f"❌ XML template loading failed: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     root = tk.Tk()
